@@ -4,44 +4,22 @@
   <meta charset="UTF-8">
   <title>WarpScout Chain</title>
   <style>
-    * { box-sizing: border-box; margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background: #0b0f19; color: #e2e8f0; padding: 18px; user-select: none; }
     .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 10px; margin-bottom: 14px; }
     .title { font-size: 17px; font-weight: 700; color: #38bdf8; }
     .badge { font-size: 11px; background: #0369a1; color: #e0f2fe; padding: 2px 8px; border-radius: 99px; }
     .section { background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
     label { font-size: 12px; color: #94a3b8; margin-bottom: 6px; display: block; font-weight: 500; }
-    .radio-group { display: flex; gap: 16px; font-size: 13px; }
     .btn-main { width: 100%; background: #2563eb; color: #fff; border: none; padding: 12px; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; }
     .btn-main:hover { background: #1d4ed8; }
     
-    /* 实时扫描看板 */
-    .scan-dashboard {
-      background: #0f172a;
-      border: 1px solid #1e293b;
-      border-radius: 6px;
-      padding: 10px 12px;
-      margin-top: 10px;
-      display: none;
-    }
+    .scan-dashboard { background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; padding: 10px 12px; margin-top: 10px; display: none; }
     .scan-info-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px; }
     .progress-bar-bg { width: 100%; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
     .progress-bar-val { width: 0%; height: 100%; background: #38bdf8; transition: width 0.1s; }
 
-    /* 实时日志窗口 */
-    .log-box {
-      background: #030712;
-      border: 1px solid #1f2937;
-      border-radius: 6px;
-      padding: 10px;
-      height: 120px;
-      overflow-y: auto;
-      font-family: monospace;
-      font-size: 11px;
-      color: #34d399;
-      margin-top: 10px;
-      white-space: pre-wrap;
-    }
+    .log-box { background: #030712; border: 1px solid #1f2937; border-radius: 6px; padding: 10px; height: 110px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #34d399; margin-top: 10px; white-space: pre-wrap; }
     
     .output-box { margin-top: 12px; display: none; }
     .export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
@@ -53,51 +31,46 @@
 <body>
   <div class="header">
     <div class="title">WarpScout Chain</div>
-    <span class="badge">双层 WARP 真实解锁</span>
+    <span class="badge">双层 WARP-on-WARP 链式</span>
   </div>
 
   <div class="section">
-    <label>[1] 抗封锁传输协议 (Outer Tunnel)</label>
-    <div class="radio-group">
-      <label><input type="radio" name="proto" value="awg" checked> AWG (AmneziaWG - 随机杂讯)</label>
-      <label><input type="radio" name="proto" value="h2"> MASQUE (H2 / TCP 443)</label>
+    <label>出站架构原理</label>
+    <div style="font-size: 12px; color: #38bdf8; line-height: 1.5;">
+      [外层: 优选大陆 IP 突破 GFW 阻断] ➜ [内层: 二次握手获取海外纯净 IP 解锁 AI]
     </div>
   </div>
 
-  <button class="btn-main" id="btnStart" onclick="startRun()">🚀 开始真实探测与双层注册</button>
+  <button class="btn-main" id="btnStart" onclick="startRun()">🚀 开始真实测速与链式配置生成</button>
 
-  <!-- 实时扫描大盘 -->
   <div class="scan-dashboard" id="scanDashboard">
     <div class="scan-info-row">
-      <span id="scanStatus">探测中...</span>
+      <span id="scanStatus">正在并发探测延迟...</span>
       <span id="scanCount">0 / 0</span>
     </div>
     <div class="progress-bar-bg"><div class="progress-bar-val" id="scanBar"></div></div>
     <div class="scan-info-row" style="margin-top: 6px; color: #94a3b8; font-size: 11px;">
-      <span id="currentTestAddr">正在测试: -</span>
+      <span id="currentTestAddr">当前端点: -</span>
       <span id="currentLatency">-</span>
     </div>
   </div>
 
-  <!-- 实时日志 -->
-  <div class="log-box" id="logWindow">[系统就绪] 等待执行...</div>
+  <div class="log-box" id="logWindow">[准备就绪] 点击上方按钮开始执行...</div>
 
-  <!-- 导出全平台配置 -->
   <div class="output-box" id="outputBox">
-    <label>本地订阅 (Sing-box):</label>
+    <label>Sing-box 本地订阅链接:</label>
     <input type="text" id="subUrl" class="sub-input" readonly value="http://127.0.0.1:8888/sub">
 
-    <label style="margin-top: 10px;">点击直接下载对应客户端配置文件：</label>
+    <label style="margin-top: 10px;">点击直接下载对应客户端链式配置文件：</label>
     <div class="export-grid">
-      <button class="btn-export" onclick="downloadFile('warp-awg.conf', awgData)">📁 导出 AWG (.conf)</button>
-      <button class="btn-export" onclick="downloadFile('warp-singbox.json', jsonData)">📁 导出 Sing-box (.json)</button>
-      <button class="btn-export" onclick="downloadFile('warp-clash.yaml', yamlData)">📁 导出 Clash (.yaml)</button>
-      <button class="btn-export" onclick="downloadFile('warp-shadowrocket.conf', srData)">🚀 导出小火箭 (.conf)</button>
+      <button class="btn-export" onclick="downloadFile('warp-singbox-chain.json', jsonData)">⚡ 导出 Sing-box (.json)</button>
+      <button class="btn-export" onclick="downloadFile('warp-clash-chain.yaml', yamlData)">⚡ 导出 Clash-Meta (.yaml)</button>
+      <button class="btn-export" style="grid-column: span 2;" onclick="downloadFile('warp-amneziawg.conf', awgData)">📁 导出 AmneziaWG (.conf)</button>
     </div>
   </div>
 
   <script>
-    let awgData = "", yamlData = "", jsonData = "", srData = "";
+    let jsonData = "", yamlData = "", awgData = "";
 
     function appendLog(msg) {
       const box = document.getElementById('logWindow');
@@ -105,7 +78,6 @@
       box.scrollTop = box.scrollHeight;
     }
 
-    // 绑定 Wails 事件监听
     window.addEventListener("DOMContentLoaded", () => {
       if (window.runtime && window.runtime.EventsOn) {
         window.runtime.EventsOn("log", function(msg) {
@@ -116,11 +88,11 @@
           document.getElementById('scanDashboard').style.display = 'block';
           document.getElementById('scanBar').style.width = data.percent + '%';
           document.getElementById('scanCount').innerText = `${data.current} / ${data.total} (${data.percent}%)`;
-          document.getElementById('currentTestAddr').innerText = '当前端点: ' + data.ip;
+          document.getElementById('currentTestAddr').innerText = '测试中: ' + data.ip;
           if (data.latency > 0) {
-            document.getElementById('currentLatency').innerText = '延迟: ' + data.latency + 'ms';
+            document.getElementById('currentLatency').innerText = data.latency + 'ms';
           } else {
-            document.getElementById('currentLatency').innerText = '超时无响应';
+            document.getElementById('currentLatency').innerText = '超时';
           }
         });
       }
@@ -130,16 +102,13 @@
       document.getElementById('btnStart').disabled = true;
       document.getElementById('outputBox').style.display = 'none';
       document.getElementById('scanDashboard').style.display = 'block';
-      document.getElementById('logWindow').innerText = "[任务启动] 初始化探测引擎...";
+      document.getElementById('logWindow').innerText = "[任务启动] 开始端点扫描与 API 注册...";
 
       try {
-        const proto = document.querySelector('input[name="proto"]:checked').value;
-        const res = await window.go.main.App.GenerateAllConfigs(proto, 10);
-
-        awgData = res.awgConf;
+        const res = await window.go.main.App.GenerateAllConfigs("awg", 10);
         jsonData = res.singbox;
         yamlData = res.clashYaml;
-        srData = res.shadowrocketConf;
+        awgData = res.awgConf;
 
         document.getElementById('subUrl').value = res.subUrl;
         document.getElementById('outputBox').style.display = 'block';
