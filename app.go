@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"math/big"
 	"net"
@@ -74,7 +76,6 @@ func (a *App) startLocalServer() {
 	_ = http.ListenAndServe("127.0.0.1:8888", mux)
 }
 
-// 官方 Cloudflare Anycast CIDR 核心网段
 var warpCIDRs = []string{
 	"162.159.192",
 	"162.159.193",
@@ -85,10 +86,8 @@ var warpCIDRs = []string{
 	"188.114.99",
 }
 
-// 真实运行 WireGuard 服务的 UDP 端口（坚决剔除网页端口 8443）
 var warpRealPorts = []int{2408, 500, 1701, 4500}
 
-// Cloudflare 官方静态公钥
 const cfPublicKeyBase64 = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 
 type EndpointResult struct {
@@ -136,9 +135,8 @@ func generateWireguardKeyPair() ([32]byte, [32]byte, error) {
 	return priv, pub, nil
 }
 
-// 第一步：先向 api.cloudflareclient.com 注册获取真实凭证
 func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
-	a.sendLog(fmt.Sprintf("正在向 Cloudflare 申请独立 WARP 凭证 [%s]...", tag))
+	a.sendLog(fmt.Sprintf("向 api.cloudflareclient.com 注册凭证 [%s]...", tag))
 	privBytes, pubBytes, err := generateWireguardKeyPair()
 	if err != nil {
 		return nil, err
@@ -167,7 +165,7 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		a.sendLog("直连注册接口超时，自动加载本地合规密钥对...")
+		a.sendLog("直连注册接口超时，加载离线合规密钥对...")
 		return defaultAccount(privBytes, pubBytes), nil
 	}
 	defer resp.Body.Close()
@@ -186,7 +184,7 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 		}
 	}
 
-	a.sendLog(fmt.Sprintf("✔ 成功获取 Cloudflare 官方凭证 [%s] ID: %s", tag, reply.ID[:8]+"..."))
+	a.sendLog(fmt.Sprintf("✔ 成功注册 Cloudflare 账号 [%s] ID: %s", tag, reply.ID[:8]+"..."))
 
 	v4 := reply.Config.Interface.Addresses.V4
 	if v4 == "" {
@@ -220,21 +218,37 @@ func defaultAccount(priv, pub [32]byte) *WarpAccount {
 	}
 }
 
-// 核心实现：构造 100% 符合 WireGuard RFC 规范的 Noise_IK 握手报文 (148 字节)
+// 严格实现 RFC 标准 HMAC-BLAKE2s
+func hmacBlake2s(key []byte, data []byte) []byte {
+	h := hmac.New(func() hash.Hash {
+		x, _ := blake2s.New256(nil)
+		return x
+	}, key)
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+func kdf2(ck []byte, ikm []byte) ([]byte, []byte) {
+	prk := hmacBlake2s(ck, ikm)
+	t1 := hmacBlake2s(prk, []byte{0x01})
+	t2 := hmacBlake2s(prk, append(t1, 0x02))
+	return t1, t2
+}
+
+// 构造 100% 符合 WireGuard RFC 的 Noise_IK 握手包 (148 字节)
 func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerPub [32]byte) ([]byte, error) {
+	hInit := blake2s.Sum256([]byte("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"))
+	chainingKey := hInit[:]
+
 	h0, _ := blake2s.New256(nil)
-	h0.Write([]byte("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"))
-	chainingKey := h0.Sum(nil)
+	h0.Write(chainingKey)
+	h0.Write([]byte("WireGuard v1 zx2c4 Jason@zx2c4.com"))
+	hash := h0.Sum(nil)
 
 	h1, _ := blake2s.New256(nil)
-	h1.Write(chainingKey)
-	h1.Write([]byte("WireGuard v1 zx2c4 Jason@zx2c4.com"))
-	hash := h1.Sum(nil)
-
-	h2, _ := blake2s.New256(nil)
-	h2.Write(hash)
-	h2.Write(peerPub[:])
-	hash = h2.Sum(nil)
+	h1.Write(hash)
+	h1.Write(peerPub[:])
+	hash = h1.Sum(nil)
 
 	var ephPriv [32]byte
 	if _, err := rand.Read(ephPriv[:]); err != nil {
@@ -246,28 +260,18 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 	var ephPub [32]byte
 	curve25519.ScalarBaseMult(&ephPub, &ephPriv)
 
-	h3, _ := blake2s.New256(nil)
-	h3.Write(hash)
-	h3.Write(ephPub[:])
-	hash = h3.Sum(nil)
+	h2, _ := blake2s.New256(nil)
+	h2.Write(hash)
+	h2.Write(ephPub[:])
+	hash = h2.Sum(nil)
 
 	ss1, err := curve25519.X25519(ephPriv[:], peerPub[:])
 	if err != nil {
 		return nil, err
 	}
 
-	kdf1, _ := blake2s.New256(chainingKey)
-	kdf1.Write(ss1)
-	t0 := kdf1.Sum(nil)
-
-	k1, _ := blake2s.New256(t0)
-	k1.Write([]byte{0x01})
-	chainingKey = k1.Sum(nil)
-
-	k2, _ := blake2s.New256(t0)
-	k2.Write(chainingKey)
-	k2.Write([]byte{0x02})
-	key1 := k2.Sum(nil)
+	var key1 []byte
+	chainingKey, key1 = kdf2(chainingKey, ss1)
 
 	aead1, err := chacha20poly1305.New(key1)
 	if err != nil {
@@ -276,28 +280,18 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 	nonce1 := make([]byte, chacha20poly1305.NonceSize)
 	encryptedStatic := aead1.Seal(nil, nonce1, clientPub[:], hash)
 
-	h4, _ := blake2s.New256(nil)
-	h4.Write(hash)
-	h4.Write(encryptedStatic)
-	hash = h4.Sum(nil)
+	h3, _ := blake2s.New256(nil)
+	h3.Write(hash)
+	h3.Write(encryptedStatic)
+	hash = h3.Sum(nil)
 
 	ss2, err := curve25519.X25519(clientPriv[:], peerPub[:])
 	if err != nil {
 		return nil, err
 	}
 
-	kdf2, _ := blake2s.New256(chainingKey)
-	kdf2.Write(ss2)
-	t0_2 := kdf2.Sum(nil)
-
-	k3, _ := blake2s.New256(t0_2)
-	k3.Write([]byte{0x01})
-	chainingKey = k3.Sum(nil)
-
-	k4, _ := blake2s.New256(t0_2)
-	k4.Write(chainingKey)
-	k4.Write([]byte{0x02})
-	key2 := k4.Sum(nil)
+	var key2 []byte
+	chainingKey, key2 = kdf2(chainingKey, ss2)
 
 	tai64n := make([]byte, 12)
 	now := time.Now().UTC()
@@ -334,8 +328,8 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 	return msg, nil
 }
 
-// 严格检验 92 字节返回包（坚决不搞 TCP 虚假兜底）
-func realWireGuardProbe(ip string, port int, packet []byte, timeout time.Duration) (int64, bool) {
+// 核心探测：先发 Jc 混淆垃圾包突破 GFW，再发真实握手等待 92 字节应答
+func realWireGuardProbeWithJunk(ip string, port int, packet []byte, timeout time.Duration) (int64, bool) {
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip, port))
 	if err != nil {
 		return 0, false
@@ -349,6 +343,15 @@ func realWireGuardProbe(ip string, port int, packet []byte, timeout time.Duratio
 
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 
+	// 先发送 4 个 40~70 字节随机垃圾包，打乱 GFW 的 DPI 深度识别
+	for j := 0; j < 4; j++ {
+		junkLen := 40 + (j * 8)
+		junk := make([]byte, junkLen)
+		rand.Read(junk)
+		_, _ = conn.Write(junk)
+		time.Sleep(2 * time.Millisecond)
+	}
+
 	start := time.Now()
 	if _, err := conn.Write(packet); err != nil {
 		return 0, false
@@ -356,7 +359,6 @@ func realWireGuardProbe(ip string, port int, packet []byte, timeout time.Duratio
 
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
-	// WireGuard 服务端必须回复固定 92 字节应答包 (Type 2: Handshake Response)
 	if err == nil && n == 92 && buf[0] == 2 {
 		rtt := time.Since(start).Milliseconds()
 		return rtt, true
@@ -385,15 +387,14 @@ func getScanIPPool(maxHosts int) []string {
 	return pool
 }
 
-// 第二步：携带合法凭证执行真实并发测速（耗时约 40~60 秒）
 func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []EndpointResult {
 	defer func() {
 		if r := recover(); r != nil {
-			a.sendLog(fmt.Sprintf("测速异常保护: %v", r))
+			a.sendLog(fmt.Sprintf("测速引擎异常拦截: %v", r))
 		}
 	}()
 
-	ips := getScanIPPool(75)
+	ips := getScanIPPool(65)
 	type task struct {
 		ip   string
 		port int
@@ -407,7 +408,7 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []Endpo
 	}
 
 	total := len(taskList)
-	a.sendLog(fmt.Sprintf("🚀 发送标准 Noise_IK 握手探针，待测端点总数: %d 个 (预计耗时 40~60 秒)...", total))
+	a.sendLog(fmt.Sprintf("🚀 发送带 Jc 混淆的标准 Noise_IK 握手探针，测试总数: %d 个...", total))
 
 	var peerPubBytes [32]byte
 	decoded, _ := base64.StdEncoding.DecodeString(cfPublicKeyBase64)
@@ -415,14 +416,14 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []Endpo
 
 	packet, err := createRealWireGuardHandshake(account.PrivKeyBytes, account.PubKeyBytes, peerPubBytes)
 	if err != nil {
-		a.sendLog(fmt.Sprintf("加密握手报文生成异常: %v", err))
+		a.sendLog(fmt.Sprintf("握手加密计算失败: %v", err))
 		return nil
 	}
 
 	taskChan := make(chan task, total)
 	resChan := make(chan EndpointResult, total)
 	var completed int64
-	workerCount := 25
+	workerCount := 20
 
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
@@ -435,7 +436,7 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []Endpo
 				runs := 2
 
 				for r := 0; r < runs; r++ {
-					rtt, ok := realWireGuardProbe(t.ip, t.port, packet, 800*time.Millisecond)
+					rtt, ok := realWireGuardProbeWithJunk(t.ip, t.port, packet, 850*time.Millisecond)
 					if ok {
 						success++
 						totalRTT += rtt
@@ -485,10 +486,10 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []Endpo
 		return validEndpoints[i].Loss < validEndpoints[j].Loss
 	})
 
-	a.sendLog(fmt.Sprintf("✔ 探测完成！经真实 92 字节握手校验，捕获活端点: %d 个", len(validEndpoints)))
+	a.sendLog(fmt.Sprintf("✔ 探测完成！经实际 92 字节回包验证，捕获真实活端点: %d 个", len(validEndpoints)))
 
 	if len(validEndpoints) == 0 {
-		a.sendLog("⚠ 当前宽带拦截了所有直接 UDP 握手，自动载入 Anycast 亚太低延迟核心端点保底...")
+		a.sendLog("⚠ 当前网络 UDP 阻断极高，载入香港与日本核心 Anycast 端点保底...")
 		validEndpoints = []EndpointResult{
 			{IP: "162.159.193.10", Port: 2408, Latency: 125, Loss: 0},
 			{IP: "162.159.192.1", Port: 2408, Latency: 135, Loss: 0},
@@ -503,22 +504,19 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []Endpo
 	return validEndpoints
 }
 
-// 第三步：主流程调度（注册 ➔ 真实测速 ➔ 组装多客户端配置）
 func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, error) {
 	if count <= 0 {
 		count = 10
 	}
 
-	// 1. 注册获取凭证
 	outerAcc, _ := a.RegisterCloudflareAccount("外层抗封锁隧道")
 	innerAcc, _ := a.RegisterCloudflareAccount("内层AI解锁出口")
 
-	// 2. 携带凭证进行真实 WireGuard 握手测速
 	endpoints := a.RunWarpScoutFullEngine(outerAcc, count)
 
 	reservedStr := fmt.Sprintf("[%d, %d, %d]", outerAcc.Reserved[0], outerAcc.Reserved[1], outerAcc.Reserved[2])
 
-	// ==================== 1. Sing-box 双层链式 Detour 配置 (真正解锁 AI) ====================
+	// ==================== 1. Sing-box 双层链式 Detour 配置 (彻底根治 DNS 污染，解锁全网 AI) ====================
 	var singboxOutbounds []interface{}
 	var singboxChainTags []string
 
@@ -538,7 +536,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 				"type": "tuic", "tag": outerTag, "server": ep.IP, "server_port": 443,
 				"tls": map[string]interface{}{"enabled": true, "server_name": "engage.cloudflareclient.com"},
 			}
-		} else { // 真正匹配 Cloudflare 的 AWG 参数 (S1=0, S2=0 确保对端正常解包)
+		} else { // 严格匹配 Cloudflare 的 AWG 参数：S1=0, S2=0 确保正常解包
 			outerNode = map[string]interface{}{
 				"type": "amneziawg", "tag": outerTag, "server": ep.IP, "server_port": ep.Port,
 				"local_address":   []string{outerAcc.AddressV4 + "/32", outerAcc.AddressV6 + "/128"},
@@ -582,19 +580,20 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 
 	allOutbounds := []interface{}{selectorOutbound, urlTestOutbound}
 	allOutbounds = append(allOutbounds, singboxOutbounds...)
-	allOutbounds = append(allOutbounds, map[string]interface{}{"type": "direct", "tag": "direct"}, map[string]interface{}{"type": "block", "tag": "block"})
+	allOutbounds = append(allOutbounds, map[string]interface{}{"type": "direct", "tag": "direct"}, map[string]interface{}{"type": "block", "tag": "block"}, map[string]interface{}{"type": "dns", "tag": "dns-out"})
 
 	singboxConfig := map[string]interface{}{
 		"$schema": "https://sing-box.sagernet.org/schema.json",
 		"dns": map[string]interface{}{
 			"servers": []map[string]interface{}{
-				{"tag": "dns-remote", "address": "1.1.1.1", "detour": "节点选择"},
+				{"tag": "dns-remote", "address": "https://1.1.1.1/dns-query", "detour": "节点选择"},
 				{"tag": "dns-direct", "address": "223.5.5.5", "detour": "direct"},
 			},
 			"rules": []map[string]interface{}{
 				{"geosite": []string{"openai", "anthropic", "google"}, "server": "dns-remote"},
 				{"outbound": "any", "server": "dns-direct"},
 			},
+			"strategy": "ipv4_only",
 		},
 		"inbounds": []map[string]interface{}{
 			{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080},
@@ -602,7 +601,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"outbounds": allOutbounds,
 		"route": map[string]interface{}{
 			"rules": []map[string]interface{}{
-				{"protocol": "dns", "outbound": "dns-direct"},
+				{"protocol": "dns", "outbound": "dns-out"},
 				{"geosite": []string{"openai", "anthropic", "google"}, "outbound": "⚡ 自动优选 (故障转移)"},
 			},
 			"final": "节点选择",
@@ -610,7 +609,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 	}
 	singboxJSON, _ := json.MarshalIndent(singboxConfig, "", "  ")
 
-	// ==================== 2. Clash-Meta 单层直连配置 (保证测速全绿可用) ====================
+	// ==================== 2. Clash-Meta 优选单层直连配置 (修复 remote-dns-resolve 与 dns 语法) ====================
 	var clashProxies strings.Builder
 	var clashNodeNames []string
 
@@ -629,7 +628,9 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
     reserved: %s
     mtu: 1360
     udp: true
-    remote-dns-resolve: true
+    remote-dns-resolve: false
+    dns:
+      - 1.1.1.1
 
 `, nodeName, ep.IP, ep.Port, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKeyBase64, outerAcc.PrivateKey, reservedStr))
 	}
@@ -669,11 +670,7 @@ proxy-groups:
       - DIRECT
 
 rules:
-  - DOMAIN-SUFFIX,openai.com,WARP 手动选择
-  - DOMAIN-SUFFIX,chatgpt.com,WARP 手动选择
-  - DOMAIN-SUFFIX,anthropic.com,WARP 手动选择
-  - DOMAIN-SUFFIX,claude.ai,WARP 手动选择
-  - MATCH,GLOBAL
+  - MATCH,WARP 自动优选
 `, clashProxies.String(), strings.Join(clashNodeNames, "\n"), strings.Join(clashNodeNames, "\n"))
 
 	// ==================== 3. 官方 AmneziaWG (.conf) 单文件标准配置 ====================
