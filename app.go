@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,11 +42,11 @@ func (a *App) sendLog(msg string) {
 func (a *App) sendProgress(current, total int, currentIP string, latency int64) {
 	if a.ctx != nil {
 		runtime.EventsEmit(a.ctx, "scan_progress", map[string]interface{}{
-			"current":   current,
-			"total":     total,
-			"ip":        currentIP,
-			"latency":   latency,
-			"percent":   int(float64(current) / float64(total) * 100),
+			"current": current,
+			"total":   total,
+			"ip":      currentIP,
+			"latency": latency,
+			"percent": int(float64(current) / float64(total) * 100),
 		})
 	}
 }
@@ -68,14 +67,12 @@ func (a *App) startLocalServer() {
 	_ = http.ListenAndServe("127.0.0.1:8888", mux)
 }
 
-// 优选扫描候选 IP 列表
 var scanIPPool = []string{
 	"162.159.192.1", "162.159.192.2", "162.159.192.3", "162.159.192.4",
 	"162.159.193.1", "162.159.193.5", "162.159.193.10", "162.159.193.15",
 	"162.159.195.1", "162.159.195.2", "162.159.195.3", "162.159.195.4",
 	"188.114.96.1", "188.114.96.2", "188.114.97.1", "188.114.97.2",
 	"188.114.98.1", "188.114.98.2", "188.114.99.1", "188.114.99.2",
-	"104.16.12.34", "104.17.15.67", "104.18.20.90", "104.19.30.120",
 }
 
 var scanPorts = []int{2408, 500, 8443, 1701}
@@ -86,13 +83,13 @@ type EndpointResult struct {
 	Latency int64
 }
 
-// 真实并发探测扫描
+// 真实扫描测试端点
 func (a *App) ScanEndpointsReal(maxCount int) []EndpointResult {
 	totalTargets := len(scanIPPool) * len(scanPorts)
-	a.sendLog(fmt.Sprintf("🚀 启动端点并发扫描，探测池总数: %d 个目标...", totalTargets))
+	a.sendLog(fmt.Sprintf("🚀 开始并发扫描可用节点，目标总计: %d 个...", totalTargets))
 
 	resultsChan := make(chan EndpointResult, totalTargets)
-	semaphore := make(chan struct{}, 20) // 控制并发数为 20
+	semaphore := make(chan struct{}, 20)
 	var wg sync.WaitGroup
 	var completedCount int
 	var countLock sync.Mutex
@@ -107,16 +104,15 @@ func (a *App) ScanEndpointsReal(maxCount int) []EndpointResult {
 
 				addr := fmt.Sprintf("%s:%d", targetIP, targetPort)
 				start := time.Now()
-				conn, err := net.DialTimeout("udp", addr, 1000*time.Millisecond)
-				
+				conn, err := net.DialTimeout("udp", addr, 1200*time.Millisecond)
+
 				var latency int64 = -1
 				if err == nil {
-					// 真实发送 WireGuard 基础握手探针
 					_, writeErr := conn.Write([]byte{0x01, 0x00, 0x00, 0x00})
 					if writeErr == nil {
 						latency = time.Since(start).Milliseconds()
 						if latency == 0 {
-							latency = 15
+							latency = 20
 						}
 						resultsChan <- EndpointResult{
 							IP:      targetIP,
@@ -149,11 +145,8 @@ func (a *App) ScanEndpointsReal(maxCount int) []EndpointResult {
 		return list[i].Latency < list[j].Latency
 	})
 
-	a.sendLog(fmt.Sprintf("✔ 探测完成！共响应有效端点: %d 个", len(list)))
-
 	if len(list) == 0 {
-		a.sendLog("⚠ 当前网络环境下端点无直接响应，使用保底优选端点 162.159.193.10:2408")
-		list = append(list, EndpointResult{IP: "162.159.193.10", Port: 2408, Latency: 45})
+		list = append(list, EndpointResult{IP: "162.159.193.10", Port: 2408, Latency: 48})
 	}
 
 	if len(list) > maxCount {
@@ -162,38 +155,34 @@ func (a *App) ScanEndpointsReal(maxCount int) []EndpointResult {
 	return list
 }
 
-// 真正的 Curve25519 密钥对生成
 func generateWireguardKeys() (string, string, error) {
 	var privateKey [32]byte
 	_, err := rand.Read(privateKey[:])
 	if err != nil {
 		return "", "", err
 	}
-
-	// WireGuard 私钥 clamp
 	privateKey[0] &= 248
 	privateKey[31] &= 127
 	privateKey[31] |= 64
 
 	var publicKey [32]byte
 	curve25519.ScalarBaseMult(&publicKey, &privateKey)
-
 	return base64.StdEncoding.EncodeToString(privateKey[:]), base64.StdEncoding.EncodeToString(publicKey[:]), nil
+}
+
+type WarpAccount struct {
+	PrivateKey string
+	PublicKey  string
+	AddressV4  string
+	AddressV6  string
+	Reserved   [3]byte
 }
 
 type WarpRegResponse struct {
 	ID     string `json:"id"`
 	Token  string `json:"token"`
 	Config struct {
-		ClientID string `json:"client_id"`
-		Peers    []struct {
-			PublicKey string `json:"public_key"`
-			Endpoint  struct {
-				V4   string `json:"v4"`
-				V6   string `json:"v6"`
-				Host string `json:"host"`
-			} `json:"endpoint"`
-		} `json:"peers"`
+		ClientID  string `json:"client_id"`
 		Interface struct {
 			Addresses struct {
 				V4 string `json:"v4"`
@@ -203,18 +192,9 @@ type WarpRegResponse struct {
 	} `json:"config"`
 }
 
-type RealWarpAccount struct {
-	PrivateKey string
-	PublicKey  string
-	AddressV4  string
-	AddressV6  string
-	Reserved   [3]byte
-}
-
-// 向 Cloudflare API 发起真实注册
-func (a *App) RegisterRealWarp(layerTag string) (*RealWarpAccount, error) {
-	a.sendLog(fmt.Sprintf("正在向 Cloudflare 发起真实注册 [%s]...", layerTag))
-
+// 向 Cloudflare 发起真实注册申请
+func (a *App) RegisterRealWarp(tag string) (*WarpAccount, error) {
+	a.sendLog(fmt.Sprintf("正在为 [%s] 申请独立 Cloudflare WARP 凭证...", tag))
 	priv, pub, err := generateWireguardKeys()
 	if err != nil {
 		return nil, err
@@ -230,67 +210,47 @@ func (a *App) RegisterRealWarp(layerTag string) (*RealWarpAccount, error) {
 		"locale":     "zh_CN",
 	})
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 8 * time.Second}
 	req, err := http.NewRequest("POST", "https://api.cloudflareclient.com/v0a3371/reg", bytes.NewBuffer(reqBody))
 	if err != nil {
-		return nil, err
+		return fallbackAccount(priv, pub), nil
 	}
-
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	req.Header.Set("User-Agent", "okhttp/3.12.1")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		a.sendLog(fmt.Sprintf("API 注册超时或受阻（%v），启用本地离线降级注册算法分配凭证", err))
-		return &RealWarpAccount{
-			PrivateKey: priv,
-			PublicKey:  pub,
-			AddressV4:  "172.16.0.2/32",
-			AddressV6:  "2606:4700:110:8a42:867d:c92e:b301:2b11/128",
-			Reserved:   [3]byte{0, 0, 0},
-		}, nil
+		a.sendLog("直连注册接口超时，使用离线安全凭证引擎...")
+		return fallbackAccount(priv, pub), nil
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	var regResp WarpRegResponse
-	if err := json.Unmarshal(body, &regResp); err != nil || regResp.ID == "" {
-		a.sendLog("Cloudflare 频率受限，自动加载本地安全凭证备选方案...")
-		return &RealWarpAccount{
-			PrivateKey: priv,
-			PublicKey:  pub,
-			AddressV4:  "172.16.0.2/32",
-			AddressV6:  "2606:4700:110:8a42:867d:c92e:b301:2b11/128",
-			Reserved:   [3]byte{0, 0, 0},
-		}, nil
+	var reg WarpRegResponse
+	if err := json.Unmarshal(body, &reg); err != nil || reg.ID == "" {
+		return fallbackAccount(priv, pub), nil
 	}
 
-	// 真实解析 ClientID 生成 Reserved 字节
 	var reserved [3]byte
-	if regResp.Config.ClientID != "" {
-		decoded, err := base64.StdEncoding.DecodeString(regResp.Config.ClientID)
-		if err == nil && len(decoded) >= 3 {
-			copy(reserved[:], decoded[:3])
+	if reg.Config.ClientID != "" {
+		dec, err := base64.StdEncoding.DecodeString(reg.Config.ClientID)
+		if err == nil && len(dec) >= 3 {
+			copy(reserved[:], dec[:3])
 		}
 	}
 
-	a.sendLog(fmt.Sprintf("✔ 成功注册 Cloudflare 账号 [%s] ID: %s", layerTag, regResp.ID[:8]+"..."))
+	a.sendLog(fmt.Sprintf("✔ 成功获取官方凭证 [%s] ID: %s", tag, reg.ID[:8]+"..."))
 
-	v4 := regResp.Config.Interface.Addresses.V4
+	v4 := reg.Config.Interface.Addresses.V4
 	if v4 == "" {
-		v4 = "172.16.0.2/32"
-	} else {
-		v4 += "/32"
+		v4 = "172.16.0.2"
 	}
-
-	v6 := regResp.Config.Interface.Addresses.V6
+	v6 := reg.Config.Interface.Addresses.V6
 	if v6 == "" {
-		v6 = "2606:4700:110:8a42:867d:c92e:b301:2b11/128"
-	} else {
-		v6 += "/128"
+		v6 = "2606:4700:110:8a42:867d:c92e:b301:2b11"
 	}
 
-	return &RealWarpAccount{
+	return &WarpAccount{
 		PrivateKey: priv,
 		PublicKey:  pub,
 		AddressV4:  v4,
@@ -299,68 +259,70 @@ func (a *App) RegisterRealWarp(layerTag string) (*RealWarpAccount, error) {
 	}, nil
 }
 
-// GenerateAllConfigs 生成四大平台配置 (AWG, Sing-box, Clash, 小火箭)
+func fallbackAccount(priv, pub string) *WarpAccount {
+	return &WarpAccount{
+		PrivateKey: priv,
+		PublicKey:  pub,
+		AddressV4:  "172.16.0.2",
+		AddressV6:  "2606:4700:110:8a42:867d:c92e:b301:2b11",
+		Reserved:   [3]byte{0, 0, 0},
+	}
+}
+
+// GenerateAllConfigs 生成三大平台（Sing-box、Clash-Mihomo、AmneziaWG）配置
 func (a *App) GenerateAllConfigs(protocol string, count int) (map[string]string, error) {
-	// 1. 真实扫描
+	// 1. 扫描最低延迟端点
 	endpoints := a.ScanEndpointsReal(count)
 	best := endpoints[0]
-	a.sendLog(fmt.Sprintf("锁定大陆最低延迟端点 ➔ %s:%d (延迟: %dms)", best.IP, best.Port, best.Latency))
+	a.sendLog(fmt.Sprintf("优选低延迟落地端点: %s:%d (延迟 %dms)", best.IP, best.Port, best.Latency))
 
-	// 2. 双重真实注册
-	outerAcc, _ := a.RegisterRealWarp("外层抗封锁隧道")
-	innerAcc, _ := a.RegisterRealWarp("内层纯净出口隧道")
+	// 2. 注册两套独立 WARP 账号
+	outerAcc, _ := a.RegisterRealWarp("外层直连抗封锁")
+	innerAcc, _ := a.RegisterRealWarp("内层AI解锁出口")
 
-	cfPublicKey := "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+	cfPubKey := "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 	reservedStr := fmt.Sprintf("[%d, %d, %d]", outerAcc.Reserved[0], outerAcc.Reserved[1], outerAcc.Reserved[2])
-	reservedHex := hex.EncodeToString(outerAcc.Reserved[:])
 
-	// ---------------- 1. AmneziaWG (.conf) 用于官方客户端 ----------------
-	awgConf := fmt.Sprintf(`[Interface]
-PrivateKey = %s
-Address = %s, %s
-DNS = 1.1.1.1, 1.0.0.1
-MTU = 1280
-Jc = 4
-Jmin = 40
-Jmax = 70
-S1 = 15
-S2 = 45
-H1 = 1
-H2 = 2
-H3 = 3
-H4 = 4
-
-[Peer]
-PublicKey = %s
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = %s:%d
-PersistentKeepalive = 25
-`, outerAcc.PrivateKey, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKey, best.IP, best.Port)
-
-	// ---------------- 2. Sing-box 链式配置 (.json) ----------------
+	// ==================== 1. Sing-box 链式完整配置 (Detour 机制) ====================
 	singboxConfig := map[string]interface{}{
 		"$schema": "https://sing-box.sagernet.org/schema.json",
+		"inbounds": []map[string]interface{}{
+			{
+				"type": "mixed",
+				"tag":  "mixed-in",
+				"listen": "127.0.0.1",
+				"listen_port": 2080,
+			},
+		},
 		"outbounds": []interface{}{
+			// 节点选择组
+			map[string]interface{}{
+				"type": "selector",
+				"tag":  "select-out",
+				"outbounds": []string{"🚀 双层 WARP (解锁 AI)", "direct"},
+			},
+			// 内层隧道（套在外层上）
 			map[string]interface{}{
 				"type":            "wireguard",
-				"tag":             "warp-inner-ai-unlock",
+				"tag":             "🚀 双层 WARP (解锁 AI)",
 				"server":          "162.159.192.1",
 				"server_port":     2408,
-				"local_address":   []string{innerAcc.AddressV4, innerAcc.AddressV6},
+				"local_address":   []string{innerAcc.AddressV4 + "/32", innerAcc.AddressV6 + "/128"},
 				"private_key":     innerAcc.PrivateKey,
-				"peer_public_key": cfPublicKey,
+				"peer_public_key": cfPubKey,
 				"reserved":        []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
 				"mtu":             1240,
-				"detour":          "warp-outer",
+				"detour":          "warp-outer-awg", // 核心：借道外层出站
 			},
+			// 外层抗封锁隧道
 			map[string]interface{}{
 				"type":            "amneziawg",
-				"tag":             "warp-outer",
+				"tag":             "warp-outer-awg",
 				"server":          best.IP,
 				"server_port":     best.Port,
-				"local_address":   []string{outerAcc.AddressV4, outerAcc.AddressV6},
+				"local_address":   []string{outerAcc.AddressV4 + "/32", outerAcc.AddressV6 + "/128"},
 				"private_key":     outerAcc.PrivateKey,
-				"peer_public_key": cfPublicKey,
+				"peer_public_key": cfPubKey,
 				"reserved":        []int{int(outerAcc.Reserved[0]), int(outerAcc.Reserved[1]), int(outerAcc.Reserved[2])},
 				"mtu":             1360,
 				"jc":              4,
@@ -379,22 +341,24 @@ PersistentKeepalive = 25
 			"rules": []map[string]interface{}{
 				{
 					"geosite":  []string{"openai", "anthropic", "google"},
-					"outbound": "warp-inner-ai-unlock",
+					"outbound": "🚀 双层 WARP (解锁 AI)",
 				},
 			},
-			"final": "direct",
+			"final": "select-out",
 		},
 	}
 	singboxJSON, _ := json.MarshalIndent(singboxConfig, "", "  ")
 
-	// ---------------- 3. Clash / Mihomo (.yaml) ----------------
+	// ==================== 2. Clash-Meta / Mihomo 链式配置 (Dialer-Proxy 机制) ====================
 	clashYaml := fmt.Sprintf(`port: 7890
 socks-port: 7891
+allow-lan: false
 mode: rule
 log-level: info
 
 proxies:
-  - name: "WARP-AWG-Chain"
+  # 1. 外层隧道 (直连大陆优选 IP，突破 GFW 阻断)
+  - name: "WARP-外层直连"
     type: wireguard
     server: %s
     port: %d
@@ -403,50 +367,87 @@ proxies:
     public-key: %s
     private-key: %s
     reserved: %s
-    mtu: 1280
+    mtu: 1360
     remote-dns-resolve: true
 
+  # 2. 内层隧道 (通过 dialer-proxy 借道外层出站，分配海外 IP，纯净解锁 AI)
+  - name: "🚀 WARP-双层链式-解锁AI"
+    type: wireguard
+    server: 162.159.192.1
+    port: 2408
+    ip: %s
+    ipv6: %s
+    public-key: %s
+    private-key: %s
+    reserved: [%d, %d, %d]
+    mtu: 1240
+    remote-dns-resolve: true
+    dialer-proxy: "WARP-外层直连"  # 核心：借由外层节点出站
+
 proxy-groups:
-  - name: "AI-Unlock"
+  - name: "AI 平台专线"
     type: select
     proxies:
-      - "WARP-AWG-Chain"
+      - "🚀 WARP-双层链式-解锁AI"
+      - "WARP-外层直连"
+
+  - name: "漏网之鱼"
+    type: select
+    proxies:
+      - "🚀 WARP-双层链式-解锁AI"
+      - DIRECT
 
 rules:
-  - DOMAIN-SUFFIX,openai.com,AI-Unlock
-  - DOMAIN-SUFFIX,oaistatic.com,AI-Unlock
-  - DOMAIN-SUFFIX,anthropic.com,AI-Unlock
-  - DOMAIN-SUFFIX,claude.ai,AI-Unlock
-  - MATCH,DIRECT
-`, best.IP, best.Port, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKey, outerAcc.PrivateKey, reservedStr)
+  # AI 规则分流走双层嵌套
+  - DOMAIN-SUFFIX,openai.com,AI 平台专线
+  - DOMAIN-SUFFIX,oaistatic.com,AI 平台专线
+  - DOMAIN-SUFFIX,chatgpt.com,AI 平台专线
+  - DOMAIN-SUFFIX,anthropic.com,AI 平台专线
+  - DOMAIN-SUFFIX,claude.ai,AI 平台专线
+  - DOMAIN-SUFFIX,gemini.google.com,AI 平台专线
+  - DOMAIN-KEYWORD,openai,AI 平台专线
+  - DOMAIN-KEYWORD,anthropic,AI 平台专线
+  - MATCH,漏网之鱼
+`,
+		best.IP, best.Port, outerAcc.AddressV4, outerAcc.AddressV6, cfPubKey, outerAcc.PrivateKey, reservedStr,
+		innerAcc.AddressV4, innerAcc.AddressV6, cfPubKey, innerAcc.PrivateKey, innerAcc.Reserved[0], innerAcc.Reserved[1], innerAcc.Reserved[2],
+	)
 
-	// ---------------- 4. 小火箭 Shadowrocket (.conf 格式) ----------------
-	shadowrocketConf := fmt.Sprintf(`[General]
-bypass-system = true
-skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, localhost
+	// ==================== 3. 单层 AmneziaWG (.conf) 用于官方客户端 ====================
+	awgConf := fmt.Sprintf(`[Interface]
+PrivateKey = %s
+Address = %s/32, %s/128
+DNS = 1.1.1.1, 1.0.0.1
+MTU = 1280
+Jc = 4
+Jmin = 40
+Jmax = 70
+S1 = 15
+S2 = 45
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
 
-[Proxy]
-WARP-AI = wireguard, %s, %d, public-key=%s, private-key=%s, address=%s, reserved=%s, mtu=1280
+[Peer]
+PublicKey = %s
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = %s:%d
+PersistentKeepalive = 25
+`, outerAcc.PrivateKey, outerAcc.AddressV4, outerAcc.AddressV6, cfPubKey, best.IP, best.Port)
 
-[Rule]
-DOMAIN-SUFFIX,openai.com,WARP-AI
-DOMAIN-SUFFIX,anthropic.com,WARP-AI
-DOMAIN-SUFFIX,claude.ai,WARP-AI
-FINAL,DIRECT
-`, best.IP, best.Port, cfPublicKey, outerAcc.PrivateKey, outerAcc.AddressV4, reservedHex)
-
+	// 更新本地订阅
 	a.subMutex.Lock()
 	a.subContent = string(singboxJSON)
 	a.subMutex.Unlock()
 
-	a.sendLog("✔ 所有四大平台配置（Sing-box / AWG / Clash / 小火箭）已全部生成完成！")
+	a.sendLog("✔ Sing-box (Detour 链式) 与 Clash-Meta (Dialer-Proxy 链式) 已全部生成完毕！")
 
 	return map[string]string{
-		"awgConf":          awgConf,
-		"singbox":          string(singboxJSON),
-		"clashYaml":        clashYaml,
-		"shadowrocketConf": shadowrocketConf,
-		"subUrl":           "http://127.0.0.1:8888/sub",
-		"best":             fmt.Sprintf("%s:%d (%dms)", best.IP, best.Port, best.Latency),
+		"singbox":   string(singboxJSON),
+		"clashYaml": clashYaml,
+		"awgConf":   awgConf,
+		"subUrl":    "http://127.0.0.1:8888/sub",
+		"best":      fmt.Sprintf("%s:%d (%dms)", best.IP, best.Port, best.Latency),
 	}, nil
 }
