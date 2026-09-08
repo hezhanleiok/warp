@@ -1,0 +1,15 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "WarpScout-Chain",
+  "outputfilename": "WarpScoutChain",
+  "frontend:dir": "frontend",
+  "author": {
+    "name": "WarpScout Developer"
+  },
+  "info": {
+    "productName": "WarpScout Chain",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright 2026",
+    "comments": "Warp-on-Warp AI Unlocker"
+  }
+}
