@@ -1,7 +1,7 @@
 name: Build Windows Single Exe
 
 on:
-  workflow_dispatch: # 仅保留手动点击运行
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -23,7 +23,7 @@ jobs:
 
       - name: Install Wails CLI
         run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@latest
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.9.2
 
       - name: Build Single-File Executable
         run: |
