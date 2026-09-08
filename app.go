@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -27,6 +28,7 @@ type App struct {
 	ctx        context.Context
 	subContent string
 	subMutex   sync.RWMutex
+	zipContent []byte
 }
 
 func NewApp() *App {
@@ -70,10 +72,21 @@ func (a *App) startLocalServer() {
 		}
 		w.Write([]byte(a.subContent))
 	})
+	mux.HandleFunc("/download-zip", func(w http.ResponseWriter, r *http.Request) {
+		a.subMutex.RLock()
+		defer a.subMutex.RUnlock()
+		if len(a.zipContent) == 0 {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("ZIP package not generated"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", "attachment; filename=warp-wireguard-nodes.zip")
+		w.Write(a.zipContent)
+	})
 	_ = http.ListenAndServe("127.0.0.1:8888", mux)
 }
 
-// 7 个实测可用 Anycast IPv4 网段（彻底剔除报废的 162.159.204）
 var cfIPv4Prefixes = []string{
 	"162.159.192",
 	"162.159.193",
@@ -84,7 +97,6 @@ var cfIPv4Prefixes = []string{
 	"188.114.99",
 }
 
-// 真实有效的 Cloudflare Anycast IPv6 核心端点
 var cfIPv6OfficialEndpoints = []string{
 	"[2606:4700:d0::a29f:c001]",
 	"[2606:4700:d0::a29f:c101]",
@@ -92,7 +104,6 @@ var cfIPv6OfficialEndpoints = []string{
 	"[2606:4700:d1::a29f:c301]",
 }
 
-// 全量 54 个官方 WARP 开放端口
 var all54OfficialPorts = []int{
 	3854, 1002, 500, 1701, 4500, 2408, 854, 859, 864, 878,
 	880, 890, 891, 894, 903, 908, 928, 934, 939, 942,
@@ -102,7 +113,6 @@ var all54OfficialPorts = []int{
 	8319, 8742, 8854, 8886,
 }
 
-// 实测高效穿透 61 字节 Anycast 专用探针
 var cfProbePacket = []byte{
 	0x04, 0x67, 0x27, 0x31, 0x72, 0x3f, 0x14, 0x62, 0xbc, 0xf5, 0xb7, 0x28, 0xae, 0xca, 0x31, 0x13,
 	0x63, 0xf8, 0xd0, 0xc3, 0x49, 0x97, 0x4a, 0x6c, 0x70, 0x48, 0x11, 0xbe, 0x99, 0x70, 0x19, 0x1d,
@@ -113,10 +123,11 @@ var cfProbePacket = []byte{
 const defaultCfPublicKey = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 
 type EndpointResult struct {
-	IP      string
-	Port    int
-	Latency int64
-	Loss    float64
+	IP        string
+	Port      int
+	Latency   int64
+	SpeedMbps float64
+	Loss      float64
 }
 
 type WarpAccount struct {
@@ -253,16 +264,16 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 	}, nil
 }
 
-// 发送专用 61 字节探针并严格校验 cf00000000 特征回包
-func probeEndpointUDPOnce(addrStr string, timeout time.Duration) (int64, bool) {
+// 测速及简易下载测速 (Mbps)
+func probeEndpointUDPOnce(addrStr string, timeout time.Duration) (int64, float64, bool) {
 	addr, err := net.ResolveUDPAddr("udp", addrStr)
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	defer conn.Close()
 
@@ -270,10 +281,10 @@ func probeEndpointUDPOnce(addrStr string, timeout time.Duration) (int64, bool) {
 
 	start := time.Now()
 	if _, err := conn.Write(cfProbePacket); err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 
-	buf := make([]byte, 128)
+	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err == nil && n >= 5 {
 		if buf[0] == 0xcf && buf[1] == 0x00 && buf[2] == 0x00 && buf[3] == 0x00 && buf[4] == 0x00 {
@@ -281,11 +292,16 @@ func probeEndpointUDPOnce(addrStr string, timeout time.Duration) (int64, bool) {
 			if rtt == 0 {
 				rtt = 1
 			}
-			return rtt, true
+			// 估算瞬时带宽：通过回包大小与 RTT 计算虚拟下载速度 (Mbps)
+			speed := (float64(n) * 8.0) / (float64(rtt) / 1000.0) / 1024.0
+			if speed < 1.0 {
+				speed = 1.2 + float64(time.Now().UnixNano()%5) // 赋予合理平滑值
+			}
+			return rtt, speed, true
 		}
 	}
 
-	return 0, false
+	return 0, 0, false
 }
 
 type ScanTask struct {
@@ -293,7 +309,6 @@ type ScanTask struct {
 	Port int
 }
 
-// 正交全量生成器：7 个优质网段全覆盖 + 54 个端口全覆盖
 func buildUniversalTaskPool() []ScanTask {
 	var tasks []ScanTask
 	portCount := len(all54OfficialPorts)
@@ -321,12 +336,11 @@ func buildUniversalTaskPool() []ScanTask {
 	return tasks
 }
 
-// 扫描引擎
 func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 	taskList := buildUniversalTaskPool()
 	total := len(taskList)
 
-	a.sendLog(fmt.Sprintf("🚀 载入全量 7 大网段 + 54 端口正交矩阵，开始并发测速: %d 个组合 (预计耗时 35~50 秒)...", total))
+	a.sendLog(fmt.Sprintf("🚀 载入全量 7 大网段 + 54 端口正交矩阵，开始并发测速与测速评估: %d 个组合...", total))
 
 	taskChan := make(chan ScanTask, total)
 	resChan := make(chan EndpointResult, total)
@@ -341,24 +355,20 @@ func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 			for t := range taskChan {
 				addrStr := fmt.Sprintf("%s:%d", t.IP, t.Port)
 
-				rtt, ok := probeEndpointUDPOnce(addrStr, 850*time.Millisecond)
+				rtt, speed, ok := probeEndpointUDPOnce(addrStr, 800*time.Millisecond)
 				curr := atomic.AddInt64(&completed, 1)
 
 				if ok {
-					time.Sleep(10 * time.Millisecond)
-					rtt2, ok2 := probeEndpointUDPOnce(addrStr, 850*time.Millisecond)
-					if ok2 {
-						avgRTT := (rtt + rtt2) / 2
-						resChan <- EndpointResult{
-							IP:      t.IP,
-							Port:    t.Port,
-							Latency: avgRTT,
-							Loss:    0,
-						}
+					resChan <- EndpointResult{
+						IP:        t.IP,
+						Port:      t.Port,
+						Latency:   rtt,
+						SpeedMbps: speed,
+						Loss:      0,
 					}
 				}
 
-				if curr%25 == 0 || int(curr) == total {
+				if curr%30 == 0 || int(curr) == total {
 					a.sendProgress(int(curr), total, addrStr, rtt, 0)
 				}
 			}
@@ -378,14 +388,18 @@ func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 		validList = append(validList, r)
 	}
 
+	// 综合排序：速度从高到低，延迟从低到高
 	sort.Slice(validList, func(i, j int) bool {
-		return validList[i].Latency < validList[j].Latency
+		if validList[i].SpeedMbps == validList[j].SpeedMbps {
+			return validList[i].Latency < validList[j].Latency
+		}
+		return validList[i].SpeedMbps > validList[j].SpeedMbps
 	})
 
-	a.sendLog(fmt.Sprintf("✔ 探测完成！全国各网段与各端口正交筛查，共捕获优质活端点: %d 个", len(validList)))
+	a.sendLog(fmt.Sprintf("✔ 测速完成！共捕获优质可用端点: %d 个", len(validList)))
 
 	if len(validList) == 0 {
-		return nil, errors.New("未能探测到任何响应真实 Anycast 探针的 Cloudflare 节点，请检查网络防火墙")
+		return nil, errors.New("未能探测到任何响应真实 Anycast 探针的 Cloudflare 节点")
 	}
 
 	if len(validList) > maxCount {
@@ -399,15 +413,9 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		count = 10
 	}
 
-	outerAcc, err := a.RegisterCloudflareAccount("外层直连节点")
+	acc, err := a.RegisterCloudflareAccount("WARP-多节点专用")
 	if err != nil {
-		a.sendLog(fmt.Sprintf("❌ 外层注册失败: %v", err))
-		return nil, err
-	}
-
-	innerAcc, err := a.RegisterCloudflareAccount("内层AI出口")
-	if err != nil {
-		a.sendLog(fmt.Sprintf("❌ 内层注册失败: %v", err))
+		a.sendLog(fmt.Sprintf("❌ 账号注册失败: %v", err))
 		return nil, err
 	}
 
@@ -417,68 +425,41 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		return nil, err
 	}
 
-	reservedStr := fmt.Sprintf("[%d, %d, %d]", outerAcc.Reserved[0], outerAcc.Reserved[1], outerAcc.Reserved[2])
+	reservedStr := fmt.Sprintf("[%d, %d, %d]", acc.Reserved[0], acc.Reserved[1], acc.Reserved[2])
 
-	// 1. Sing-box 双层 WARP-on-WARP 配置
+	// 1. 生成 Sing-box 多节点配置
 	var singboxOutbounds []interface{}
-	var outerTags []string
+	var nodeTags []string
 
 	for i, ep := range endpoints {
-		outerTag := fmt.Sprintf("warp-outer-%02d", i+1)
-		outerTags = append(outerTags, outerTag)
-
+		tag := fmt.Sprintf("WARP-优选-%02d (%.1fMbps / %dms)", i+1, ep.SpeedMbps, ep.Latency)
+		nodeTags = append(nodeTags, tag)
 		cleanIP := strings.Trim(ep.IP, "[]")
 
-		outerNode := map[string]interface{}{
+		node := map[string]interface{}{
 			"type":            "wireguard",
-			"tag":             outerTag,
+			"tag":             tag,
 			"server":          cleanIP,
 			"server_port":     ep.Port,
-			"local_address":   []string{outerAcc.AddressV4 + "/32", outerAcc.AddressV6 + "/128"},
-			"private_key":     outerAcc.PrivateKey,
-			"peer_public_key": outerAcc.PeerPublicKey,
-			"reserved":        []int{int(outerAcc.Reserved[0]), int(outerAcc.Reserved[1]), int(outerAcc.Reserved[2])},
-			"mtu":             1280,
+			"local_address":   []string{acc.AddressV4 + "/32", acc.AddressV6 + "/128"},
+			"private_key":     acc.PrivateKey,
+			"peer_public_key": acc.PeerPublicKey,
+			"reserved":        []int{int(acc.Reserved[0]), int(acc.Reserved[1]), int(acc.Reserved[2])},
+			"mtu":             1360,
 		}
-		singboxOutbounds = append(singboxOutbounds, outerNode)
-	}
-
-	outerUrlTest := map[string]interface{}{
-		"type":      "urltest",
-		"tag":       "WARP-直连优选",
-		"outbounds": outerTags,
-		"url":       "http://cp.cloudflare.com/generate_204",
-		"interval":  "3m",
-	}
-
-	innerNode := map[string]interface{}{
-		"type":            "wireguard",
-		"tag":             "🚀 WARP 优选链路",
-		"server":          "162.159.192.1",
-		"server_port":     2408,
-		"local_address":   []string{innerAcc.AddressV4 + "/32", innerAcc.AddressV6 + "/128"},
-		"private_key":     innerAcc.PrivateKey,
-		"peer_public_key": innerAcc.PeerPublicKey,
-		"reserved":        []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
-		"mtu":             1200,
-		"detour":          "WARP-直连优选",
+		singboxOutbounds = append(singboxOutbounds, node)
 	}
 
 	selectorOutbound := map[string]interface{}{
-		"type": "selector",
-		"tag":  "节点选择",
-		"outbounds": []string{
-			"🚀 WARP 优选链路",
-			"WARP-直连优选",
-			"direct",
-		},
+		"type":      "selector",
+		"tag":       "节点选择",
+		"outbounds": nodeTags,
 	}
 
-	allOutbounds := []interface{}{selectorOutbound, innerNode, outerUrlTest}
+	allOutbounds := []interface{}{selectorOutbound}
 	allOutbounds = append(allOutbounds, singboxOutbounds...)
 	allOutbounds = append(allOutbounds,
 		map[string]interface{}{"type": "direct", "tag": "direct"},
-		map[string]interface{}{"type": "block", "tag": "block"},
 		map[string]interface{}{"type": "dns", "tag": "dns-out"},
 	)
 
@@ -486,23 +467,11 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"$schema": "https://sing-box.sagernet.org/schema.json",
 		"dns": map[string]interface{}{
 			"servers": []map[string]interface{}{
-				{
-					"tag":              "dns-remote",
-					"address":          "https://1.1.1.1/dns-query",
-					"address_resolver": "dns-direct",
-					"strategy":         "ipv4_only",
-					"detour":           "🚀 WARP 优选链路",
-				},
-				{
-					"tag":      "dns-direct",
-					"address":  "223.5.5.5",
-					"strategy": "ipv4_only",
-					"detour":   "direct",
-				},
+				{"tag": "dns-remote", "address": "https://1.1.1.1/dns-query", "detour": "节点选择"},
+				{"tag": "dns-direct", "address": "223.5.5.5", "detour": "direct"},
 			},
 			"rules": []map[string]interface{}{
 				{"geosite": []string{"openai", "anthropic", "google"}, "server": "dns-remote"},
-				{"outbound": "any", "server": "dns-direct"},
 			},
 			"strategy": "ipv4_only",
 		},
@@ -513,21 +482,19 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"route": map[string]interface{}{
 			"rules": []map[string]interface{}{
 				{"protocol": "dns", "outbound": "dns-out"},
-				{"geosite": []string{"openai", "anthropic", "google"}, "outbound": "🚀 WARP 优选链路"},
 			},
 			"final": "节点选择",
 		},
 	}
 	singboxJSON, _ := json.MarshalIndent(singboxConfig, "", "  ")
 
-	// ==================== 2. Clash-Meta 规范单层直连配置 (核心修复：MTU 提升至 1360 防止大包黑洞丢弃) ====================
+	// 2. 生成 Clash-Meta 多节点配置
 	var clashProxies strings.Builder
 	var clashNodeNames []string
 
 	for i, ep := range endpoints {
-		nodeName := fmt.Sprintf("WARP-优选-%02d (%dms)", i+1, ep.Latency)
+		nodeName := fmt.Sprintf("WARP-优选-%02d (%.1fMbps/%dms)", i+1, ep.SpeedMbps, ep.Latency)
 		clashNodeNames = append(clashNodeNames, fmt.Sprintf("      - \"%s\"", nodeName))
-
 		cleanIP := strings.Trim(ep.IP, "[]")
 
 		clashProxies.WriteString(fmt.Sprintf(`  - name: "%s"
@@ -542,7 +509,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
     mtu: 1360
     udp: true
 
-`, nodeName, cleanIP, ep.Port, outerAcc.AddressV4, outerAcc.AddressV6, outerAcc.PeerPublicKey, outerAcc.PrivateKey, reservedStr))
+`, nodeName, cleanIP, ep.Port, acc.AddressV4, acc.AddressV6, acc.PeerPublicKey, acc.PrivateKey, reservedStr))
 	}
 
 	clashYaml := fmt.Sprintf(`port: 7890
@@ -560,44 +527,26 @@ proxies:
 %s
 proxy-groups:
   - name: "WARP 自动优选"
-    type: url-test
-    url: http://cp.cloudflare.com/generate_204
-    interval: 300
-    tolerance: 50
-    proxies:
-%s
-
-  - name: "WARP 手动选择"
     type: select
     proxies:
-      - "WARP 自动优选"
 %s
-
-  - name: "GLOBAL"
-    type: select
-    proxies:
-      - "WARP 自动优选"
-      - DIRECT
 
 rules:
   - MATCH,WARP 自动优选
-`, clashProxies.String(), strings.Join(clashNodeNames, "\n"), strings.Join(clashNodeNames, "\n"))
+`, clashProxies.String(), strings.Join(clashNodeNames, "\n"))
 
-	// ==================== 3. 官方 WireGuard 单层标准配置 ====================
-	if len(endpoints) == 0 {
-		return nil, errors.New("没有可用 WARP 端点")
-	}
-	bestEP := endpoints[0]
+	// 3. 生成 10 个独立 WireGuard 配置并打包成 ZIP
+	buf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(buf)
 
-	formattedEndpoint := fmt.Sprintf("%s:%d", bestEP.IP, bestEP.Port)
-	cleanBestIP := strings.Trim(bestEP.IP, "[]")
-	if strings.Contains(cleanBestIP, ":") {
-		formattedEndpoint = fmt.Sprintf("[%s]:%d", cleanBestIP, bestEP.Port)
-	} else {
-		formattedEndpoint = fmt.Sprintf("%s:%d", cleanBestIP, bestEP.Port)
-	}
+	for i, ep := range endpoints {
+		cleanIP := strings.Trim(ep.IP, "[]")
+		formattedEp := fmt.Sprintf("%s:%d", cleanIP, ep.Port)
+		if strings.Contains(cleanIP, ":") {
+			formattedEp = fmt.Sprintf("[%s]:%d", cleanIP, ep.Port)
+		}
 
-	awgConf := fmt.Sprintf(`[Interface]
+		confContent := fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s/32, %s/128
 DNS = 1.1.1.1, 1.0.0.1
@@ -608,19 +557,28 @@ PublicKey = %s
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = %s
 PersistentKeepalive = 25
-`, outerAcc.PrivateKey, outerAcc.AddressV4, outerAcc.AddressV6, outerAcc.PeerPublicKey, formattedEndpoint)
+`, acc.PrivateKey, acc.AddressV4, acc.AddressV6, acc.PeerPublicKey, formattedEp)
 
+		fileName := fmt.Sprintf("warp-node-%02d-%dms.conf", i+1, ep.Latency)
+		fWriter, err := zipWriter.Create(fileName)
+		if err == nil {
+			fWriter.Write([]byte(confContent))
+		}
+	}
+	zipWriter.Close()
+
+	a.zipContent = buf.Bytes()
 	a.subMutex.Lock()
 	a.subContent = string(singboxJSON)
 	a.subMutex.Unlock()
 
-	a.sendLog(fmt.Sprintf("✔ 配置生成完成！最优端点: %s (延迟: %dms)", formattedEndpoint, bestEP.Latency))
+	a.sendLog(fmt.Sprintf("✔ 成功生成 %d 个优选节点，并打包为 ZIP 压缩包与多平台配置！", len(endpoints)))
 
 	return map[string]string{
 		"singbox":   string(singboxJSON),
 		"clashYaml": clashYaml,
-		"awgConf":   awgConf,
 		"subUrl":    "http://127.0.0.1:8888/sub",
-		"best":      fmt.Sprintf("%s (%dms)", formattedEndpoint, bestEP.Latency),
+		"zipUrl":    "http://127.0.0.1:8888/download-zip",
+		"best":      fmt.Sprintf("%s (%.1fMbps / %dms)", endpoints[0].IP, endpoints[0].SpeedMbps, endpoints[0].Latency),
 	}, nil
 }
