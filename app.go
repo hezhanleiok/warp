@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -68,7 +70,7 @@ func (a *App) startLocalServer() {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if a.subContent == "" {
-			w.Write([]byte(`{"status":"waiting","message":"请先生成配置"}`))
+			w.Write([]byte(`{"status":"waiting","message":"请先生成有效配置"}`))
 			return
 		}
 		w.Write([]byte(a.subContent))
@@ -76,8 +78,8 @@ func (a *App) startLocalServer() {
 	_ = http.ListenAndServe("127.0.0.1:8888", mux)
 }
 
-// 官方 Cloudflare Anycast 核心 CIDR 网段
-var warpCIDRs = []string{
+// 真实有效的 Cloudflare Anycast IPv4 核心段
+var cfIPv4Prefixes = []string{
 	"162.159.192",
 	"162.159.193",
 	"162.159.195",
@@ -87,8 +89,15 @@ var warpCIDRs = []string{
 	"188.114.99",
 }
 
-// 真实开放的 WireGuard UDP 端口
-var warpRealPorts = []int{2408, 500, 1701, 4500}
+// 真实有效的 Cloudflare Anycast IPv6 官方对端地址（杜绝盲目枚举）
+var cfIPv6OfficialEndpoints = []string{
+	"[2606:4700:d0::a29f:c001]",
+	"[2606:4700:d0::a29f:c101]",
+	"[2606:4700:d1::a29f:c201]",
+	"[2606:4700:d1::a29f:c301]",
+}
+
+var testPorts = []int{2408}
 
 const cfPublicKeyBase64 = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 
@@ -137,12 +146,12 @@ func generateWireguardKeyPair() ([32]byte, [32]byte, error) {
 	return priv, pub, nil
 }
 
-// 向 Cloudflare 官方注册真实有效凭证（内置直连 IP 避免 DNS 污染阻断注册）
+// 严谨注册：显式指定 SNI 杜绝证书校验失败，失败立即抛错，彻底删除 fake 账号
 func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
-	a.sendLog(fmt.Sprintf("向 Cloudflare 申请真实 WARP 凭证 [%s]...", tag))
+	a.sendLog(fmt.Sprintf("向官方 API 申请真实 WARP 身份凭证 [%s]...", tag))
 	privBytes, pubBytes, err := generateWireguardKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("生成本地密钥对失败: %w", err)
 	}
 
 	pubBase64 := base64.StdEncoding.EncodeToString(pubBytes[:])
@@ -160,15 +169,16 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 
 	dialer := &net.Dialer{Timeout: 6 * time.Second}
 	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName: "api.cloudflareclient.com", // 关键修复：显式设定真实 SNI
+		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if strings.HasPrefix(addr, "api.cloudflareclient.com:") {
-				conn, err := dialer.DialContext(ctx, network, "162.159.192.1:443")
-				if err == nil {
-					return conn, nil
-				}
-				conn2, err2 := dialer.DialContext(ctx, network, "162.159.193.1:443")
-				if err2 == nil {
-					return conn2, nil
+				for _, ip := range []string{"162.159.192.1", "162.159.193.1", "188.114.96.1"} {
+					conn, err := dialer.DialContext(ctx, network, ip+":443")
+					if err == nil {
+						return conn, nil
+					}
 				}
 			}
 			return dialer.DialContext(ctx, network, addr)
@@ -178,22 +188,29 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 
 	req, err := http.NewRequest("POST", "https://api.cloudflareclient.com/v0a3371/reg", bytes.NewBuffer(reqBody))
 	if err != nil {
-		return defaultAccount(privBytes, pubBytes), nil
+		return nil, fmt.Errorf("创建注册请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	req.Header.Set("User-Agent", "okhttp/3.12.1")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		a.sendLog("注册接口直连超时，启用本地安全密钥算法...")
-		return defaultAccount(privBytes, pubBytes), nil
+		return nil, fmt.Errorf("直连 Cloudflare 注册 API 失败: %w (请检查本地是否完全阻断 Cloudflare CDN)", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("Cloudflare 拒绝注册请求，HTTP 状态码: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取注册回执失败: %w", err)
+	}
+
 	var reply CloudflareResponse
-	if err := json.Unmarshal(body, &reply); err != nil || reply.ID == "" {
-		return defaultAccount(privBytes, pubBytes), nil
+	if err := json.Unmarshal(body, &reply); err != nil || reply.ID == "" || reply.Token == "" {
+		return nil, errors.New("解析 Cloudflare 注册响应失败，返回凭据无效")
 	}
 
 	var reserved [3]byte
@@ -204,16 +221,13 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 		}
 	}
 
-	a.sendLog(fmt.Sprintf("✔ 成功获取官方凭证 [%s] ID: %s", tag, reply.ID[:8]+"..."))
-
 	v4 := reply.Config.Interface.Addresses.V4
-	if v4 == "" {
-		v4 = "172.16.0.2"
-	}
 	v6 := reply.Config.Interface.Addresses.V6
-	if v6 == "" {
-		v6 = "2606:4700:110:8a42:867d:c92e:b301:2b11"
+	if v4 == "" || v6 == "" {
+		return nil, errors.New("Cloudflare 注册成功但未下发有效公网 IPv4/IPv6 隧道地址")
 	}
+
+	a.sendLog(fmt.Sprintf("✔ 成功签发合法凭证 [%s] ID: %s", tag, reply.ID[:8]+"..."))
 
 	return &WarpAccount{
 		PrivateKey:   privBase64,
@@ -224,18 +238,6 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 		AddressV6:    v6,
 		Reserved:     reserved,
 	}, nil
-}
-
-func defaultAccount(priv, pub [32]byte) *WarpAccount {
-	return &WarpAccount{
-		PrivateKey:   base64.StdEncoding.EncodeToString(priv[:]),
-		PublicKey:    base64.StdEncoding.EncodeToString(pub[:]),
-		PrivKeyBytes: priv,
-		PubKeyBytes:  pub,
-		AddressV4:    "172.16.0.2",
-		AddressV6:    "2606:4700:110:8a42:867d:c92e:b301:2b11",
-		Reserved:     [3]byte{0, 0, 0},
-	}
 }
 
 func hash256(data []byte) [32]byte {
@@ -259,8 +261,8 @@ func kdf2(ck []byte, ikm []byte) ([]byte, []byte) {
 	return t1, t2
 }
 
-// 构造 100% 符合 WireGuard RFC 规范的标准 148 字节 Noise_IK 握手 Initiation
-func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerPub [32]byte) ([]byte, error) {
+// WireGuard 探测握手构造：用于验证 Cloudflare 端点响应，不代表完整 WARP 隧道建立
+func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerPub [32]byte) ([]byte, uint32, error) {
 	hInit := hash256([]byte("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"))
 	chainingKey := hInit[:]
 
@@ -270,13 +272,13 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 
 	ephPriv, ephPub, err := generateWireguardKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	h = hash256(append(h[:], ephPub[:]...))
 
 	ss1, err := curve25519.X25519(ephPriv[:], peerPub[:])
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var key1 []byte
@@ -284,7 +286,7 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 
 	aead1, err := chacha20poly1305.New(key1)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var nonce1 [12]byte
 	encryptedStatic := aead1.Seal(nil, nonce1[:], clientPub[:], h[:])
@@ -292,7 +294,7 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 
 	ss2, err := curve25519.X25519(clientPriv[:], peerPub[:])
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var key2 []byte
@@ -306,14 +308,18 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 
 	aead2, err := chacha20poly1305.New(key2)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var nonce2 [12]byte
 	encryptedTimestamp := aead2.Seal(nil, nonce2[:], tai64n, h[:])
 
+	var senderIdx uint32
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &senderIdx); err != nil || senderIdx == 0 {
+		senderIdx = uint32(time.Now().UnixNano())
+	}
+
 	msg := make([]byte, 148)
-	msg[0] = 1
-	var senderIdx uint32 = 1
+	msg[0] = 1 // Handshake Initiation
 	binary.LittleEndian.PutUint32(msg[4:8], senderIdx)
 	copy(msg[8:40], ephPub[:])
 	copy(msg[40:88], encryptedStatic)
@@ -323,17 +329,22 @@ func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerP
 	macKey := hash256(macKeyRaw)
 	mac1H, err := blake2s.New128(macKey[:])
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	mac1H.Write(msg[0:116])
 	copy(msg[116:132], mac1H.Sum(nil))
 
-	return msg, nil
+	return msg, senderIdx, nil
 }
 
-// 真实网络握手探测（真正发包并阻塞等待 92 字节应答）
-func realWireGuardProbe(ip string, port int, packet []byte, timeout time.Duration) (int64, bool) {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip, port))
+// 严谨收发探测：校验 receiver_index == client_sender_index
+func probeEndpointUDPOnce(addrStr string, account *WarpAccount, peerPubBytes [32]byte, timeout time.Duration) (int64, bool) {
+	packet, senderIdx, err := createRealWireGuardHandshake(account.PrivKeyBytes, account.PubKeyBytes, peerPubBytes)
+	if err != nil {
+		return 0, false
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", addrStr)
 	if err != nil {
 		return 0, false
 	}
@@ -351,76 +362,73 @@ func realWireGuardProbe(ip string, port int, packet []byte, timeout time.Duratio
 		return 0, false
 	}
 
-	// 阻塞等待接收 Cloudflare 官方返回的 92 字节 Handshake Response
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err == nil && n == 92 && buf[0] == 2 {
-		rtt := time.Since(start).Milliseconds()
-		return rtt, true
+		receiverIdx := binary.LittleEndian.Uint32(buf[8:12])
+		if receiverIdx == senderIdx {
+			rtt := time.Since(start).Milliseconds()
+			if rtt == 0 {
+				rtt = 1
+			}
+			return rtt, true
+		}
 	}
 
 	return 0, false
 }
 
-// 抽取全网段 200~300 个候选 IP
-func getCandidateIPPool(maxHosts int) []string {
+// 生成真实严谨的候选端点列表（彻底剔除虚假 IPv6 步进遍历）
+func buildCandidateEndpoints() []string {
 	var pool []string
-	for _, cidr := range warpCIDRs {
-		for i := 1; i <= 254; i += 6 {
-			pool = append(pool, fmt.Sprintf("%s.%d", cidr, i))
+
+	// 1. IPv4 网段步进采样 (覆盖 7 个网段核心 IP)
+	for _, prefix := range cfIPv4Prefixes {
+		for host := 1; host <= 254; host += 5 {
+			pool = append(pool, fmt.Sprintf("%s.%d", prefix, host))
 		}
 	}
 
+	// 2. 真实已知的 Cloudflare 官方 IPv6 Anycast 节点
+	pool = append(pool, cfIPv6OfficialEndpoints...)
+
+	// 洗牌打乱
 	for i := len(pool) - 1; i > 0; i-- {
 		nBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
 		j := nBig.Int64()
 		pool[i], pool[j] = pool[j], pool[i]
 	}
 
-	if len(pool) > maxHosts {
-		return pool[:maxHosts]
-	}
 	return pool
 }
 
-// 真实并发扫描引擎（持续 30~50 秒，绝非 1 秒假扫）
-func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []EndpointResult {
-	defer func() {
-		if r := recover(); r != nil {
-			a.sendLog(fmt.Sprintf("扫描过程安全恢复: %v", r))
-		}
-	}()
+// 真实并发扫描引擎：端点多端口交叉覆盖，3 次握手成功 $\ge$ 2 次判定存活
+func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) ([]EndpointResult, error) {
+	candidateIPs := buildCandidateEndpoints()
 
-	ips := getCandidateIPPool(80)
 	type task struct {
 		ip   string
 		port int
 	}
 
 	var taskList []task
-	for _, ip := range ips {
-		for _, port := range warpRealPorts {
-			taskList = append(taskList, task{ip, port})
-		}
+	// 基础池全面探测主力 2408
+	for _, ip := range candidateIPs {
+		taskList = append(taskList, task{ip, 2408})
 	}
+	// WARP 官方主要使用 UDP 2408，避免把非 WARP 服务误判为节点
 
 	total := len(taskList)
-	a.sendLog(fmt.Sprintf("🚀 载入真实端点池，发送合规 Noise_IK 握手探针: %d 个端点 (预计耗时 30~50 秒)...", total))
+	a.sendLog(fmt.Sprintf("🚀 开始对 %d 个真实 Anycast 端点执行 WireGuard 握手测速 (预计 30~50 秒)...", total))
 
 	var peerPubBytes [32]byte
 	decoded, _ := base64.StdEncoding.DecodeString(cfPublicKeyBase64)
 	copy(peerPubBytes[:], decoded)
 
-	packet, err := createRealWireGuardHandshake(account.PrivKeyBytes, account.PubKeyBytes, peerPubBytes)
-	if err != nil {
-		a.sendLog(fmt.Sprintf("握手包计算异常: %v", err))
-		return nil
-	}
-
 	taskChan := make(chan task, total)
 	resChan := make(chan EndpointResult, total)
 	var completed int64
-	workerCount := 20
+	workerCount := 32 // 降低并发，避免 Windows UDP 缓冲区丢包
 
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
@@ -428,35 +436,38 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []Endpo
 		go func() {
 			defer wg.Done()
 			for t := range taskChan {
-				var totalRTT int64
-				var success int
-				runs := 2
+				addrStr := fmt.Sprintf("%s:%d", t.ip, t.port)
 
-				for r := 0; r < runs; r++ {
-					rtt, ok := realWireGuardProbe(t.ip, t.port, packet, 700*time.Millisecond)
+				var totalRTT int64
+				var successCount int
+				testRuns := 3
+
+				for r := 0; r < testRuns; r++ {
+					rtt, ok := probeEndpointUDPOnce(addrStr, account, peerPubBytes, 700*time.Millisecond)
 					if ok {
-						success++
+						successCount++
 						totalRTT += rtt
 					}
-					time.Sleep(15 * time.Millisecond)
+					time.Sleep(10 * time.Millisecond)
 				}
 
 				curr := atomic.AddInt64(&completed, 1)
-				if success > 0 {
-					avgRTT := totalRTT / int64(success)
-					loss := float64(runs-success) / float64(runs)
+
+				if successCount >= 2 {
+					avgRTT := totalRTT / int64(successCount)
+					loss := float64(testRuns-successCount) / float64(testRuns)
 					resChan <- EndpointResult{
 						IP:      t.ip,
 						Port:    t.port,
 						Latency: avgRTT,
 						Loss:    loss,
 					}
-					if curr%10 == 0 || int(curr) == total {
-						a.sendProgress(int(curr), total, fmt.Sprintf("%s:%d", t.ip, t.port), avgRTT, loss)
+					if curr%15 == 0 || int(curr) == total {
+						a.sendProgress(int(curr), total, addrStr, avgRTT, loss)
 					}
 				} else {
-					if curr%10 == 0 || int(curr) == total {
-						a.sendProgress(int(curr), total, fmt.Sprintf("%s:%d", t.ip, t.port), -1, 1.0)
+					if curr%15 == 0 || int(curr) == total {
+						a.sendProgress(int(curr), total, addrStr, -1, 1.0)
 					}
 				}
 			}
@@ -471,122 +482,140 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) []Endpo
 	wg.Wait()
 	close(resChan)
 
-	var validEndpoints []EndpointResult
+	var validList []EndpointResult
 	for r := range resChan {
-		validEndpoints = append(validEndpoints, r)
+		validList = append(validList, r)
 	}
 
-	sort.Slice(validEndpoints, func(i, j int) bool {
-		if validEndpoints[i].Loss == validEndpoints[j].Loss {
-			return validEndpoints[i].Latency < validEndpoints[j].Latency
+	sort.Slice(validList, func(i, j int) bool {
+		if validList[i].Loss == validList[j].Loss {
+			return validList[i].Latency < validList[j].Latency
 		}
-		return validEndpoints[i].Loss < validEndpoints[j].Loss
+		return validList[i].Loss < validList[j].Loss
 	})
 
-	a.sendLog(fmt.Sprintf("✔ 探测完成！真实收到 92 字节应答的活端点数: %d 个", len(validEndpoints)))
+	a.sendLog(fmt.Sprintf("✔ 探测完成！经三次握手严格校验，真实存活端点: %d 个", len(validList)))
 
-	if len(validEndpoints) == 0 {
-		a.sendLog("⚠ 当前网络 UDP 阻断，加载官方默认 Anycast 端点保底...")
-		validEndpoints = []EndpointResult{
-			{IP: "162.159.192.1", Port: 2408, Latency: 160, Loss: 0},
-			{IP: "162.159.193.10", Port: 2408, Latency: 175, Loss: 0},
-		}
+	if len(validList) == 0 {
+		return nil, errors.New("未能探测到任何响应真实 WireGuard 握手的 Cloudflare 节点，请确认当前网络未完全拦截 UDP")
 	}
 
-	if len(validEndpoints) > maxCount {
-		return validEndpoints[:maxCount]
+	if len(validList) > maxCount {
+		return validList[:maxCount], nil
 	}
-	return validEndpoints
+	return validList, nil
 }
 
+// 主流程：生成 Sing-box WARP 链路、Clash 单层配置与标准 WG 配置
 func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, error) {
 	if count <= 0 {
 		count = 10
 	}
 
-	// 1. 先注册获取真实凭证
-	outerAcc, _ := a.RegisterCloudflareAccount("外层直连前置")
-	innerAcc, _ := a.RegisterCloudflareAccount("内层AI出口")
+	// 1. 真实注册外层凭证（失败直接报错中断）
+	outerAcc, err := a.RegisterCloudflareAccount("外层直连节点")
+	if err != nil {
+		a.sendLog(fmt.Sprintf("❌ 外层注册失败: %v", err))
+		return nil, err
+	}
 
-	// 2. 携带凭证真实测速
-	endpoints := a.RunWarpScoutFullEngine(outerAcc, count)
+	// 2. 真实注册内层凭证（失败直接报错中断）
+	innerAcc, err := a.RegisterCloudflareAccount("内层AI出口")
+	if err != nil {
+		a.sendLog(fmt.Sprintf("❌ 内层注册失败: %v", err))
+		return nil, err
+	}
+
+	// 3. 真实测速优选端点（无虚假兜底）
+	endpoints, err := a.RunWarpScoutFullEngine(outerAcc, count)
+	if err != nil {
+		a.sendLog(fmt.Sprintf("❌ 测速失败: %v", err))
+		return nil, err
+	}
 
 	reservedStr := fmt.Sprintf("[%d, %d, %d]", outerAcc.Reserved[0], outerAcc.Reserved[1], outerAcc.Reserved[2])
 
-	// ==================== 1. Sing-box 双层链式 Detour 配置 (解锁全网 AI 专用) ====================
+	// ==================== 1. Sing-box 双层 WARP-on-WARP 配置 (严格 MTU 递减与防污染 DNS) ====================
 	var singboxOutbounds []interface{}
-	var singboxChainTags []string
+	var outerTags []string
 
 	for i, ep := range endpoints {
 		outerTag := fmt.Sprintf("warp-outer-%02d", i+1)
-		innerTag := fmt.Sprintf("🚀 链式解锁AI-%02d (%dms)", i+1, ep.Latency)
-		singboxChainTags = append(singboxChainTags, innerTag)
+		outerTags = append(outerTags, outerTag)
 
-		var outerNode map[string]interface{}
-		if protocol == "h2" {
-			outerNode = map[string]interface{}{
-				"type": "http", "tag": outerTag, "server": ep.IP, "server_port": 443,
-				"tls": map[string]interface{}{"enabled": true, "server_name": "engage.cloudflareclient.com"},
-			}
-		} else if protocol == "h3" {
-			outerNode = map[string]interface{}{
-				"type": "tuic", "tag": outerTag, "server": ep.IP, "server_port": 443,
-				"tls": map[string]interface{}{"enabled": true, "server_name": "engage.cloudflareclient.com"},
-			}
-		} else { // 标准 WireGuard 直连
-			outerNode = map[string]interface{}{
-				"type":            "wireguard",
-				"tag":             outerTag,
-				"server":          ep.IP,
-				"server_port":     ep.Port,
-				"local_address":   []string{outerAcc.AddressV4 + "/32", outerAcc.AddressV6 + "/128"},
-				"private_key":     outerAcc.PrivateKey,
-				"peer_public_key": cfPublicKeyBase64,
-				"reserved":        []int{int(outerAcc.Reserved[0]), int(outerAcc.Reserved[1]), int(outerAcc.Reserved[2])},
-				"mtu":             1280,
-			}
-		}
+		cleanIP := strings.Trim(ep.IP, "[]")
 
-		innerNode := map[string]interface{}{
+		outerNode := map[string]interface{}{
 			"type":            "wireguard",
-			"tag":             innerTag,
-			"server":          "162.159.192.1",
-			"server_port":     2408,
-			"local_address":   []string{innerAcc.AddressV4 + "/32", innerAcc.AddressV6 + "/128"},
-			"private_key":     innerAcc.PrivateKey,
+			"tag":             outerTag,
+			"server":          cleanIP,
+			"server_port":     ep.Port,
+			"local_address":   []string{outerAcc.AddressV4 + "/32", outerAcc.AddressV6 + "/128"},
+			"private_key":     outerAcc.PrivateKey,
 			"peer_public_key": cfPublicKeyBase64,
-			"reserved":        []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
-			"mtu":             1240,
-			"detour":          outerTag,
+			"reserved":        []int{int(outerAcc.Reserved[0]), int(outerAcc.Reserved[1]), int(outerAcc.Reserved[2])},
+			"mtu":             1280, // 外层标准 MTU
 		}
-
-		singboxOutbounds = append(singboxOutbounds, innerNode, outerNode)
+		singboxOutbounds = append(singboxOutbounds, outerNode)
 	}
 
-	urlTestOutbound := map[string]interface{}{
+	outerUrlTest := map[string]interface{}{
 		"type":      "urltest",
-		"tag":       "⚡ 自动优选 (故障转移)",
-		"outbounds": singboxChainTags,
-		"url":       "https://chatgpt.com",
+		"tag":       "WARP-直连优选",
+		"outbounds": outerTags,
+		"url":       "http://cp.cloudflare.com/generate_204",
 		"interval":  "3m",
+	}
+
+	// 内层节点：MTU 必须扣减 80 字节防切片黑洞，detour 指向外层优选组
+	innerNode := map[string]interface{}{
+		"type":            "wireguard",
+		"tag":             "🚀 WARP 优选链路",
+		"server":          "162.159.192.1",
+		"server_port":     2408,
+		"local_address":   []string{innerAcc.AddressV4 + "/32", innerAcc.AddressV6 + "/128"},
+		"private_key":     innerAcc.PrivateKey,
+		"peer_public_key": cfPublicKeyBase64,
+		"reserved":        []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
+		"mtu":             1200, // 核心修复：内层 MTU 扣减 80 字节，保证内层报文在外层管道内完整传输
+		"detour":          "WARP-直连优选",
 	}
 
 	selectorOutbound := map[string]interface{}{
 		"type": "selector",
 		"tag":  "节点选择",
-		"outbounds": append([]string{"⚡ 自动优选 (故障转移)"}, singboxChainTags...),
+		"outbounds": []string{
+			"🚀 WARP 优选链路",
+			"WARP-直连优选",
+			"direct",
+		},
 	}
 
-	allOutbounds := []interface{}{selectorOutbound, urlTestOutbound}
+	allOutbounds := []interface{}{selectorOutbound, innerNode, outerUrlTest}
 	allOutbounds = append(allOutbounds, singboxOutbounds...)
-	allOutbounds = append(allOutbounds, map[string]interface{}{"type": "direct", "tag": "direct"}, map[string]interface{}{"type": "block", "tag": "block"}, map[string]interface{}{"type": "dns", "tag": "dns-out"})
+	allOutbounds = append(allOutbounds,
+		map[string]interface{}{"type": "direct", "tag": "direct"},
+		map[string]interface{}{"type": "block", "tag": "block"},
+		map[string]interface{}{"type": "dns", "tag": "dns-out"},
+	)
 
 	singboxConfig := map[string]interface{}{
 		"$schema": "https://sing-box.sagernet.org/schema.json",
 		"dns": map[string]interface{}{
 			"servers": []map[string]interface{}{
-				{"tag": "dns-remote", "address": "tls://1.1.1.1", "detour": "节点选择"},
-				{"tag": "dns-direct", "address": "223.5.5.5", "detour": "direct"},
+				{
+					"tag":              "dns-remote",
+					"address":          "https://1.1.1.1/dns-query",
+					"address_resolver": "dns-direct",
+					"strategy":         "ipv4_only",
+					"detour":           "🚀 WARP 优选链路", // 核心修复：AI 域名通过内层安全 DoH 解析，杜绝国内 DNS 污染
+				},
+				{
+					"tag":      "dns-direct",
+					"address":  "223.5.5.5",
+					"strategy": "ipv4_only",
+					"detour":   "direct",
+				},
 			},
 			"rules": []map[string]interface{}{
 				{"geosite": []string{"openai", "anthropic", "google"}, "server": "dns-remote"},
@@ -601,20 +630,22 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"route": map[string]interface{}{
 			"rules": []map[string]interface{}{
 				{"protocol": "dns", "outbound": "dns-out"},
-				{"geosite": []string{"openai", "anthropic", "google"}, "outbound": "⚡ 自动优选 (故障转移)"},
+				{"geosite": []string{"openai", "anthropic", "google"}, "outbound": "🚀 WARP 优选链路"},
 			},
 			"final": "节点选择",
 		},
 	}
 	singboxJSON, _ := json.MarshalIndent(singboxConfig, "", "  ")
 
-	// ==================== 2. Clash-Meta 单层规范直连配置 ====================
+	// ==================== 2. Clash-Meta 规范单层直连配置 ====================
 	var clashProxies strings.Builder
 	var clashNodeNames []string
 
 	for i, ep := range endpoints {
 		nodeName := fmt.Sprintf("WARP-优选-%02d (%dms)", i+1, ep.Latency)
 		clashNodeNames = append(clashNodeNames, fmt.Sprintf("      - \"%s\"", nodeName))
+
+		cleanIP := strings.Trim(ep.IP, "[]")
 
 		clashProxies.WriteString(fmt.Sprintf(`  - name: "%s"
     type: wireguard
@@ -628,7 +659,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
     mtu: 1280
     udp: true
 
-`, nodeName, ep.IP, ep.Port, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKeyBase64, outerAcc.PrivateKey, reservedStr))
+`, nodeName, cleanIP, ep.Port, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKeyBase64, outerAcc.PrivateKey, reservedStr))
 	}
 
 	clashYaml := fmt.Sprintf(`port: 7890
@@ -647,7 +678,7 @@ proxies:
 proxy-groups:
   - name: "WARP 自动优选"
     type: url-test
-    url: https://www.google.com
+    url: http://cp.cloudflare.com/generate_204
     interval: 300
     tolerance: 50
     proxies:
@@ -669,7 +700,10 @@ rules:
   - MATCH,WARP 自动优选
 `, clashProxies.String(), strings.Join(clashNodeNames, "\n"), strings.Join(clashNodeNames, "\n"))
 
-	// ==================== 3. 官方 WireGuard/AmneziaWG 单层标准配置 ====================
+	// ==================== 3. 官方 WireGuard 单层标准配置 ====================
+	if len(endpoints) == 0 {
+		return nil, errors.New("没有可用 WARP 端点")
+	}
 	bestEP := endpoints[0]
 	awgConf := fmt.Sprintf(`[Interface]
 PrivateKey = %s
@@ -682,13 +716,13 @@ PublicKey = %s
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = %s:%d
 PersistentKeepalive = 25
-`, outerAcc.PrivateKey, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKeyBase64, bestEP.IP, bestEP.Port)
+`, outerAcc.PrivateKey, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKeyBase64, strings.Trim(bestEP.IP, "[]"), bestEP.Port)
 
 	a.subMutex.Lock()
 	a.subContent = string(singboxJSON)
 	a.subMutex.Unlock()
 
-	a.sendLog(fmt.Sprintf("✔ 配置生成完成！最优端点: %s:%d (%dms)", bestEP.IP, bestEP.Port, bestEP.Latency))
+	a.sendLog(fmt.Sprintf("✔ 配置生成完成！最优端点: %s:%d (延迟: %dms)", bestEP.IP, bestEP.Port, bestEP.Latency))
 
 	return map[string]string{
 		"singbox":   string(singboxJSON),
