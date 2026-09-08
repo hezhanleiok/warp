@@ -53,7 +53,7 @@
     <label>[2] 优选节点生成数量 (Endpoint Count)</label>
     <div style="display: flex; align-items: center; gap: 8px;">
       <input type="number" id="epCount" class="input-box" value="10" min="1" max="30">
-      <span style="font-size: 12px; color: #94a3b8;">个（自动生成多条链式出站与容灾组）</span>
+      <span style="font-size: 12px; color: #94a3b8;">个（自动生成多节点聚合与测速排序组）</span>
     </div>
   </div>
 
@@ -61,7 +61,7 @@
 
   <div class="scan-dashboard" id="scanDashboard">
     <div class="scan-info-row">
-      <span id="scanStatus">正在并发探测延迟...</span>
+      <span id="scanStatus">正在并发探测延迟与速度...</span>
       <span id="scanCount">0 / 0</span>
     </div>
     <div class="progress-bar-bg"><div class="progress-bar-val" id="scanBar"></div></div>
@@ -81,16 +81,16 @@
     <label>Sing-box 本地订阅链接:</label>
     <input type="text" id="subUrl" class="sub-input" readonly value="http://127.0.0.1:8888/sub">
 
-    <label style="margin-top: 10px;">点击直接下载包含多节点与自动故障转移的配置：</label>
+    <label style="margin-top: 10px;">点击直接下载包含多节点与测速排序的配置：</label>
     <div class="export-grid">
-      <button class="btn-export" onclick="downloadFile('warp-singbox-multi.json', jsonData)">⚡ 导出 Sing-box (双层解锁AI)</button>
-      <button class="btn-export" onclick="downloadFile('warp-clash-multi.yaml', yamlData)">⚡ 导出 Clash-Meta (多节点)</button>
-      <button class="btn-export" style="grid-column: span 2;" onclick="downloadFile('warp-wireguard.conf', awgData)">📁 导出 WireGuard (标准配置)</button>
+      <button class="btn-export" onclick="downloadFile('warp-singbox-multi.json', jsonData)">⚡ 导出 Sing-box (多节点JSON)</button>
+      <button class="btn-export" onclick="downloadFile('warp-clash-multi.yaml', yamlData)">⚡ 导出 Clash-Meta (多节点YAML)</button>
+      <button class="btn-export" style="grid-column: span 2;" onclick="window.location.href='http://127.0.0.1:8888/download-zip'">📦 下载 WireGuard 10节点配置 (.zip)</button>
     </div>
   </div>
 
   <script>
-    let jsonData = "", yamlData = "", awgData = "";
+    let jsonData = "", yamlData = "";
 
     function appendLog(msg) {
       const box = document.getElementById('logWindow');
@@ -147,7 +147,7 @@
           document.getElementById('scanCount').innerText = `${data.current} / ${data.total} (${data.percent}%)`;
           document.getElementById('currentTestAddr').innerText = '测试中: ' + data.ip;
           if (data.latency > 0) {
-            document.getElementById('currentLatency').innerText = '真实延迟: ' + data.latency + 'ms';
+            document.getElementById('currentLatency').innerText = '延迟: ' + data.latency + 'ms';
           } else {
             document.getElementById('currentLatency').innerText = '超时';
           }
@@ -167,7 +167,6 @@
         const res = await window.go.main.App.GenerateConfigs(proto, count);
         jsonData = res.singbox;
         yamlData = res.clashYaml;
-        awgData = res.awgConf;
 
         document.getElementById('subUrl').value = res.subUrl;
         document.getElementById('outputBox').style.display = 'block';
