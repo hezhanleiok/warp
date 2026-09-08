@@ -1,13 +1,7 @@
 name: Build Windows Single Exe
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    tags:
-      - 'v*'
-  workflow_dispatch:
+  workflow_dispatch: # 仅保留手动点击运行
 
 jobs:
   build-windows:
