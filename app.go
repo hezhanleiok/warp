@@ -73,8 +73,8 @@ func (a *App) startLocalServer() {
 	_ = http.ListenAndServe("127.0.0.1:8888", mux)
 }
 
-// 官方 7 个真实可用的 Anycast IPv4 网段（彻底剔除 100% 丢包的死段 162.159.204）
-var validCFIPv4Prefixes = []string{
+// 7 个实测可用 Anycast IPv4 网段（彻底剔除报废的 162.159.204）
+var cfIPv4Prefixes = []string{
 	"162.159.192",
 	"162.159.193",
 	"162.159.195",
@@ -84,17 +84,25 @@ var validCFIPv4Prefixes = []string{
 	"188.114.99",
 }
 
-// 官方 54 个全部 WARP 开放端口
+// 真实有效的 Cloudflare Anycast IPv6 核心端点
+var cfIPv6OfficialEndpoints = []string{
+	"[2606:4700:d0::a29f:c001]",
+	"[2606:4700:d0::a29f:c101]",
+	"[2606:4700:d1::a29f:c201]",
+	"[2606:4700:d1::a29f:c301]",
+}
+
+// 全量 54 个官方 WARP 开放端口
 var all54OfficialPorts = []int{
-	500, 854, 859, 864, 878, 880, 890, 891, 894, 903,
-	908, 928, 934, 939, 942, 943, 945, 946, 955, 968,
-	987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 1387,
-	1701, 1843, 2371, 2408, 2506, 3138, 3476, 3581, 3854, 4177,
-	4198, 4233, 4500, 5279, 5956, 7103, 7152, 7156, 7281, 7559,
+	3854, 1002, 500, 1701, 4500, 2408, 854, 859, 864, 878,
+	880, 890, 891, 894, 903, 908, 928, 934, 939, 942,
+	943, 945, 946, 955, 968, 987, 988, 1010, 1014, 1018,
+	1070, 1074, 1180, 1387, 1843, 2371, 2506, 3138, 3476, 3581,
+	4177, 4198, 4233, 5279, 5956, 7103, 7152, 7156, 7281, 7559,
 	8319, 8742, 8854, 8886,
 }
 
-// 实测高效穿透 61 字节 Anycast 探针
+// 实测高效穿透 61 字节 Anycast 专用探针
 var cfProbePacket = []byte{
 	0x04, 0x67, 0x27, 0x31, 0x72, 0x3f, 0x14, 0x62, 0xbc, 0xf5, 0xb7, 0x28, 0xae, 0xca, 0x31, 0x13,
 	0x63, 0xf8, 0xd0, 0xc3, 0x49, 0x97, 0x4a, 0x6c, 0x70, 0x48, 0x11, 0xbe, 0x99, 0x70, 0x19, 0x1d,
@@ -245,7 +253,7 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 	}, nil
 }
 
-// 单端点探测：校验返回是否为 cf00000000
+// 发送专用 61 字节探针并严格校验 cf00000000 特征回包
 func probeEndpointUDPOnce(addrStr string, timeout time.Duration) (int64, bool) {
 	addr, err := net.ResolveUDPAddr("udp", addrStr)
 	if err != nil {
@@ -290,30 +298,22 @@ func buildUniversalTaskPool() []ScanTask {
 	var tasks []ScanTask
 	portCount := len(all54OfficialPorts)
 
-	// 1. IPv4 网段正交覆盖 (7 个网段 × 254 主机 = 1,778 个测试组合，54 端口均匀循环)
-	for _, prefix := range validCFIPv4Prefixes {
+	// IPv4 覆盖 (7 个网段 × 254 主机 = 1,778 个测试组合，54 端口均匀循环)
+	for _, prefix := range cfIPv4Prefixes {
 		for host := 1; host <= 254; host++ {
 			ip := fmt.Sprintf("%s.%d", prefix, host)
-			// 将 54 个端口无缝分散映射到每个主机上
 			port := all54OfficialPorts[host%portCount]
 			tasks = append(tasks, ScanTask{IP: ip, Port: port})
 		}
 	}
 
-	// 2. IPv6 真实端点补充映射 (覆盖实测最优端口 3854, 1002, 2408 等)
-	v6Candidates := []string{
-		"[2606:4700:d0::a29f:c001]",
-		"[2606:4700:d0::a29f:c101]",
-		"[2606:4700:d1::a29f:c201]",
-		"[2606:4700:d1::a29f:c301]",
-	}
-	for _, v6 := range v6Candidates {
+	// IPv6 覆盖
+	for _, v6 := range cfIPv6OfficialEndpoints {
 		for _, p := range []int{3854, 1002, 2408, 500, 1701} {
 			tasks = append(tasks, ScanTask{IP: v6, Port: p})
 		}
 	}
 
-	// 洗牌打乱，平滑流量并消除集中拥塞
 	for i := len(tasks) - 1; i > 0; i-- {
 		nBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
 		j := nBig.Int64()
@@ -323,7 +323,7 @@ func buildUniversalTaskPool() []ScanTask {
 	return tasks
 }
 
-// 扫描引擎：全网段、全端口无死角探测（耗时稳定在 35~50 秒）
+// 扫描引擎
 func (a *App) RunWarpScoutFullEngine(maxCount int) ([]EndpointResult, error) {
 	taskList := buildUniversalTaskPool()
 	total := len(taskList)
@@ -421,7 +421,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 
 	reservedStr := fmt.Sprintf("[%d, %d, %d]", outerAcc.Reserved[0], outerAcc.Reserved[1], outerAcc.Reserved[2])
 
-	// ==================== 1. Sing-box 双层 WARP-on-WARP 配置 ====================
+	// 1. Sing-box 双层 WARP-on-WARP 配置
 	var singboxOutbounds []interface{}
 	var outerTags []string
 
@@ -522,7 +522,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 	}
 	singboxJSON, _ := json.MarshalIndent(singboxConfig, "", "  ")
 
-	// ==================== 2. Clash-Meta 规范单层直连配置 ====================
+	// 2. Clash-Meta 规范单层直连配置
 	var clashProxies strings.Builder
 	var clashNodeNames []string
 
@@ -585,7 +585,7 @@ rules:
   - MATCH,WARP 自动优选
 `, clashProxies.String(), strings.Join(clashNodeNames, "\n"), strings.Join(clashNodeNames, "\n"))
 
-	// ==================== 3. 官方 WireGuard 单层标准配置 ====================
+	// 3. 官方 WireGuard 单层标准配置
 	if len(endpoints) == 0 {
 		return nil, errors.New("没有可用 WARP 端点")
 	}
