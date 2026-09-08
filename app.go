@@ -298,7 +298,6 @@ func buildUniversalTaskPool() []ScanTask {
 	var tasks []ScanTask
 	portCount := len(all54OfficialPorts)
 
-	// IPv4 覆盖 (7 个网段 × 254 主机 = 1,778 个测试组合，54 端口均匀循环)
 	for _, prefix := range cfIPv4Prefixes {
 		for host := 1; host <= 254; host++ {
 			ip := fmt.Sprintf("%s.%d", prefix, host)
@@ -307,7 +306,6 @@ func buildUniversalTaskPool() []ScanTask {
 		}
 	}
 
-	// IPv6 覆盖
 	for _, v6 := range cfIPv6OfficialEndpoints {
 		for _, p := range []int{3854, 1002, 2408, 500, 1701} {
 			tasks = append(tasks, ScanTask{IP: v6, Port: p})
@@ -522,7 +520,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 	}
 	singboxJSON, _ := json.MarshalIndent(singboxConfig, "", "  ")
 
-	// 2. Clash-Meta 规范单层直连配置
+	// ==================== 2. Clash-Meta 规范单层直连配置 (核心修复：MTU 提升至 1360 防止大包黑洞丢弃) ====================
 	var clashProxies strings.Builder
 	var clashNodeNames []string
 
@@ -541,7 +539,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
     public-key: %s
     private-key: %s
     reserved: %s
-    mtu: 1280
+    mtu: 1360
     udp: true
 
 `, nodeName, cleanIP, ep.Port, outerAcc.AddressV4, outerAcc.AddressV6, outerAcc.PeerPublicKey, outerAcc.PrivateKey, reservedStr))
@@ -585,7 +583,7 @@ rules:
   - MATCH,WARP 自动优选
 `, clashProxies.String(), strings.Join(clashNodeNames, "\n"), strings.Join(clashNodeNames, "\n"))
 
-	// 3. 官方 WireGuard 单层标准配置
+	// ==================== 3. 官方 WireGuard 单层标准配置 ====================
 	if len(endpoints) == 0 {
 		return nil, errors.New("没有可用 WARP 端点")
 	}
@@ -603,7 +601,7 @@ rules:
 PrivateKey = %s
 Address = %s/32, %s/128
 DNS = 1.1.1.1, 1.0.0.1
-MTU = 1280
+MTU = 1360
 
 [Peer]
 PublicKey = %s
