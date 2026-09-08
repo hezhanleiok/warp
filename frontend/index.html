@@ -21,7 +21,11 @@
     .progress-bar-bg { width: 100%; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
     .progress-bar-val { width: 0%; height: 100%; background: #38bdf8; transition: width 0.1s; }
 
-    .log-box { background: #030712; border: 1px solid #1f2937; border-radius: 6px; padding: 10px; height: 120px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #34d399; margin-top: 10px; white-space: pre-wrap; }
+    .log-header-row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; margin-bottom: 4px; }
+    .btn-copy-log { background: #1e293b; border: 1px solid #374151; color: #38bdf8; padding: 3px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; transition: all 0.2s; }
+    .btn-copy-log:hover { background: #334155; color: #fff; }
+
+    .log-box { background: #030712; border: 1px solid #1f2937; border-radius: 6px; padding: 10px; height: 125px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #34d399; white-space: pre-wrap; word-break: break-all; }
     
     .output-box { margin-top: 12px; display: none; }
     .export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
@@ -67,6 +71,10 @@
     </div>
   </div>
 
+  <div class="log-header-row">
+    <span style="font-size: 12px; color: #94a3b8; font-weight: 500;">运行日志:</span>
+    <button id="btnCopyLog" class="btn-copy-log" onclick="copyLogContent()">📋 复制日志</button>
+  </div>
   <div class="log-box" id="logWindow">[准备就绪] 点击上方按钮开始执行...</div>
 
   <div class="output-box" id="outputBox">
@@ -77,7 +85,7 @@
     <div class="export-grid">
       <button class="btn-export" onclick="downloadFile('warp-singbox-multi.json', jsonData)">⚡ 导出 Sing-box (双层解锁AI)</button>
       <button class="btn-export" onclick="downloadFile('warp-clash-multi.yaml', yamlData)">⚡ 导出 Clash-Meta (多节点)</button>
-      <button class="btn-export" style="grid-column: span 2;" onclick="downloadFile('warp-amneziawg-multi.conf', awgData)">📁 导出 AmneziaWG (多端点)</button>
+      <button class="btn-export" style="grid-column: span 2;" onclick="downloadFile('warp-wireguard.conf', awgData)">📁 导出 WireGuard (标准配置)</button>
     </div>
   </div>
 
@@ -88,6 +96,43 @@
       const box = document.getElementById('logWindow');
       box.innerText += "\n" + msg;
       box.scrollTop = box.scrollHeight;
+    }
+
+    function copyLogContent() {
+      const text = document.getElementById('logWindow').innerText;
+      if (!text) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          showCopySuccess();
+        }).catch(() => {
+          fallbackCopy(text);
+        });
+      } else {
+        fallbackCopy(text);
+      }
+    }
+
+    function fallbackCopy(text) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      showCopySuccess();
+    }
+
+    function showCopySuccess() {
+      const btn = document.getElementById('btnCopyLog');
+      const oldText = btn.innerText;
+      btn.innerText = "✔ 日志已复制";
+      btn.style.color = "#34d399";
+      setTimeout(() => {
+        btn.innerText = oldText;
+        btn.style.color = "#38bdf8";
+      }, 2000);
     }
 
     window.addEventListener("DOMContentLoaded", () => {
