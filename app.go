@@ -89,7 +89,7 @@ var cfIPv4Prefixes = []string{
 	"188.114.99",
 }
 
-// 真实有效的 Cloudflare Anycast IPv6 官方对端地址（杜绝盲目枚举）
+// 真实有效的 Cloudflare Anycast IPv6 官方对端地址
 var cfIPv6OfficialEndpoints = []string{
 	"[2606:4700:d0::a29f:c001]",
 	"[2606:4700:d0::a29f:c101]",
@@ -146,7 +146,7 @@ func generateWireguardKeyPair() ([32]byte, [32]byte, error) {
 	return priv, pub, nil
 }
 
-// 严谨注册：显式指定 SNI 杜绝证书校验失败，失败立即抛错，彻底删除 fake 账号
+// 严谨注册：显式指定 SNI 杜绝证书校验失败，失败立即抛错
 func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 	a.sendLog(fmt.Sprintf("向官方 API 申请真实 WARP 身份凭证 [%s]...", tag))
 	privBytes, pubBytes, err := generateWireguardKeyPair()
@@ -170,7 +170,7 @@ func (a *App) RegisterCloudflareAccount(tag string) (*WarpAccount, error) {
 	dialer := &net.Dialer{Timeout: 6 * time.Second}
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			ServerName: "api.cloudflareclient.com", // 关键修复：显式设定真实 SNI
+			ServerName: "api.cloudflareclient.com",
 		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if strings.HasPrefix(addr, "api.cloudflareclient.com:") {
@@ -261,7 +261,7 @@ func kdf2(ck []byte, ikm []byte) ([]byte, []byte) {
 	return t1, t2
 }
 
-// WireGuard 探测握手构造：用于验证 Cloudflare 端点响应，不代表完整 WARP 隧道建立
+// WireGuard 探测握手构造
 func createRealWireGuardHandshake(clientPriv [32]byte, clientPub [32]byte, peerPub [32]byte) ([]byte, uint32, error) {
 	hInit := hash256([]byte("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"))
 	chainingKey := hInit[:]
@@ -378,7 +378,7 @@ func probeEndpointUDPOnce(addrStr string, account *WarpAccount, peerPubBytes [32
 	return 0, false
 }
 
-// 生成真实严谨的候选端点列表（彻底剔除虚假 IPv6 步进遍历）
+// 生成真实严谨的候选端点列表
 func buildCandidateEndpoints() []string {
 	var pool []string
 
@@ -402,7 +402,7 @@ func buildCandidateEndpoints() []string {
 	return pool
 }
 
-// 真实并发扫描引擎：端点多端口交叉覆盖，3 次握手成功 $\ge$ 2 次判定存活
+// 真实并发扫描引擎
 func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) ([]EndpointResult, error) {
 	candidateIPs := buildCandidateEndpoints()
 
@@ -412,14 +412,12 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) ([]Endp
 	}
 
 	var taskList []task
-	// 基础池全面探测主力 2408
 	for _, ip := range candidateIPs {
 		taskList = append(taskList, task{ip, 2408})
 	}
-	// WARP 官方主要使用 UDP 2408，避免把非 WARP 服务误判为节点
 
 	total := len(taskList)
-	a.sendLog(fmt.Sprintf("🚀 开始对 %d 个真实 Anycast 端点执行 WireGuard 握手测速 (预计 30~50 秒)...", total))
+	a.sendLog(fmt.Sprintf("🚀 载入 Cloudflare 全量端点池，开始握手测速: %d 个目标 (预计耗时 30~50 秒)...", total))
 
 	var peerPubBytes [32]byte
 	decoded, _ := base64.StdEncoding.DecodeString(cfPublicKeyBase64)
@@ -428,7 +426,7 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) ([]Endp
 	taskChan := make(chan task, total)
 	resChan := make(chan EndpointResult, total)
 	var completed int64
-	workerCount := 32 // 降低并发，避免 Windows UDP 缓冲区丢包
+	workerCount := 32
 
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
@@ -506,7 +504,7 @@ func (a *App) RunWarpScoutFullEngine(account *WarpAccount, maxCount int) ([]Endp
 	return validList, nil
 }
 
-// 主流程：生成 Sing-box WARP 链路、Clash 单层配置与标准 WG 配置
+// 主流程：生成 Sing-box WARP 链路、Clash 单层配置与标准 WG 配置（全配置导出选项完整保留）
 func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, error) {
 	if count <= 0 {
 		count = 10
@@ -554,7 +552,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 			"private_key":     outerAcc.PrivateKey,
 			"peer_public_key": cfPublicKeyBase64,
 			"reserved":        []int{int(outerAcc.Reserved[0]), int(outerAcc.Reserved[1]), int(outerAcc.Reserved[2])},
-			"mtu":             1280, // 外层标准 MTU
+			"mtu":             1280,
 		}
 		singboxOutbounds = append(singboxOutbounds, outerNode)
 	}
@@ -567,7 +565,6 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"interval":  "3m",
 	}
 
-	// 内层节点：MTU 必须扣减 80 字节防切片黑洞，detour 指向外层优选组
 	innerNode := map[string]interface{}{
 		"type":            "wireguard",
 		"tag":             "🚀 WARP 优选链路",
@@ -577,7 +574,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 		"private_key":     innerAcc.PrivateKey,
 		"peer_public_key": cfPublicKeyBase64,
 		"reserved":        []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
-		"mtu":             1200, // 核心修复：内层 MTU 扣减 80 字节，保证内层报文在外层管道内完整传输
+		"mtu":             1200,
 		"detour":          "WARP-直连优选",
 	}
 
@@ -608,7 +605,7 @@ func (a *App) GenerateConfigs(protocol string, count int) (map[string]string, er
 					"address":          "https://1.1.1.1/dns-query",
 					"address_resolver": "dns-direct",
 					"strategy":         "ipv4_only",
-					"detour":           "🚀 WARP 优选链路", // 核心修复：AI 域名通过内层安全 DoH 解析，杜绝国内 DNS 污染
+					"detour":           "🚀 WARP 优选链路",
 				},
 				{
 					"tag":      "dns-direct",
@@ -700,11 +697,21 @@ rules:
   - MATCH,WARP 自动优选
 `, clashProxies.String(), strings.Join(clashNodeNames, "\n"), strings.Join(clashNodeNames, "\n"))
 
-	// ==================== 3. 官方 WireGuard 单层标准配置 ====================
+	// ==================== 3. 官方 WireGuard 单层标准配置 (正确处理 IPv6 端口方括号) ====================
 	if len(endpoints) == 0 {
 		return nil, errors.New("没有可用 WARP 端点")
 	}
 	bestEP := endpoints[0]
+
+	// 关键修复：处理 IPv6 端口拼接语法，IPv6 地址加方括号，IPv4 则保持原样
+	formattedEndpoint := fmt.Sprintf("%s:%d", bestEP.IP, bestEP.Port)
+	cleanBestIP := strings.Trim(bestEP.IP, "[]")
+	if strings.Contains(cleanBestIP, ":") {
+		formattedEndpoint = fmt.Sprintf("[%s]:%d", cleanBestIP, bestEP.Port)
+	} else {
+		formattedEndpoint = fmt.Sprintf("%s:%d", cleanBestIP, bestEP.Port)
+	}
+
 	awgConf := fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s/32, %s/128
@@ -714,21 +721,21 @@ MTU = 1280
 [Peer]
 PublicKey = %s
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = %s:%d
+Endpoint = %s
 PersistentKeepalive = 25
-`, outerAcc.PrivateKey, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKeyBase64, strings.Trim(bestEP.IP, "[]"), bestEP.Port)
+`, outerAcc.PrivateKey, outerAcc.AddressV4, outerAcc.AddressV6, cfPublicKeyBase64, formattedEndpoint)
 
 	a.subMutex.Lock()
 	a.subContent = string(singboxJSON)
 	a.subMutex.Unlock()
 
-	a.sendLog(fmt.Sprintf("✔ 配置生成完成！最优端点: %s:%d (延迟: %dms)", bestEP.IP, bestEP.Port, bestEP.Latency))
+	a.sendLog(fmt.Sprintf("✔ 配置生成完成！最优端点: %s (延迟: %dms)", formattedEndpoint, bestEP.Latency))
 
 	return map[string]string{
 		"singbox":   string(singboxJSON),
 		"clashYaml": clashYaml,
 		"awgConf":   awgConf,
 		"subUrl":    "http://127.0.0.1:8888/sub",
-		"best":      fmt.Sprintf("%s:%d (%dms)", bestEP.IP, bestEP.Port, bestEP.Latency),
+		"best":      fmt.Sprintf("%s (%dms)", formattedEndpoint, bestEP.Latency),
 	}, nil
 }
