@@ -1,0 +1,19 @@
+# 构建产物 (CI 会重新构建, sing-box.exe 由 workflow 下载嵌入)
+XiaoHeWarpScout.exe
+sing-box.exe
+build/bin/
+
+# 运行时临时文件
+cache.db
+xhs-temp_proxy_*.json
+temp_proxy_*.json
+*.log
+
+# 本机归档与导出 (不属于源码)
+_旧版本归档/
+导出配置/
+.dsh-vision-router/
+
+# IDE/系统
+.DS_Store
+Thumbs.db

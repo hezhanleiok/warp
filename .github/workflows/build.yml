@@ -1,0 +1,70 @@
+name: Build Windows Single Exe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download sing-box Core
+        shell: pwsh
+        run: |
+          # sing-box 1.13.x: 支持 endpoints(新 WireGuard 语法) + 新 DNS 格式 + rule-set,
+          # 且对旧版字段保留容错. 1.12 起旧 wireguard outbound 已 FATAL, 1.14 起移除 legacy DNS.
+          $VERSION = "1.13.21"
+          $URL = "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-windows-amd64.zip"
+          
+          Write-Host "Downloading sing-box $VERSION..."
+          Invoke-WebRequest -Uri $URL -OutFile "sing-box.zip"
+          Expand-Archive -Path "sing-box.zip" -DestinationPath "temp_singbox"
+          
+          # 将 sing-box.exe 解压提取并移动到根目录
+          Get-ChildItem -Path "temp_singbox" -Filter "sing-box.exe" -Recurse | Move-Item -Destination ".\" -Force
+          
+          # 清理临时下载文件
+          Remove-Item -Path "sing-box.zip", "temp_singbox" -Recurse -Force
+          
+          # 验证是否存在，确保 //go:embed 能抓取到
+          if (-not (Test-Path ".\sing-box.exe")) {
+              Write-Error "sing-box.exe not found in root directory!"
+              exit 1
+          }
+          
+          # 验证嵌入核心版本: 必须为 1.13.x (支持 endpoints 新语法且兼容过渡期)
+          $exe = Resolve-Path ".\sing-box.exe"
+          $ver = (& $exe version | Select-Object -First 1)
+          Write-Host "Embedded core: $ver"
+          if ($ver -notmatch "1\.13\.") {
+              Write-Error "sing-box version mismatch! Expected 1.13.x, got: $ver"
+              exit 1
+          }
+
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.9.2
+
+      - name: Build Single-File Executable
+        run: |
+          go mod tidy
+          wails build -clean -ldflags "-s -w -H windowsgui"
+
+      - name: Upload Single Exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WarpScoutChain-Windows-x64
+          path: build/bin/*.exe

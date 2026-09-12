@@ -1,0 +1,15 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "XiaoHe-WarpScout",
+  "outputfilename": "XiaoHeWarpScout",
+  "frontend:dir": "frontend",
+  "author": {
+    "name": "XiaoHe"
+  },
+  "info": {
+    "productName": "XiaoHe WarpScout",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright 2026",
+    "comments": "Warp-on-Warp AI Unlocker"
+  }
+}
